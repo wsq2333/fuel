@@ -1,0 +1,849 @@
+# Fuel 实施计划
+
+> 版本: v1.0
+> 日期: 2026-08-15
+> 关联文档: [ARCH_SPEC.md](./ARCH_SPEC.md) | [IMPL_DESIGN.md](./IMPL_DESIGN.md) | [AGENTS.md](../AGENTS.md)
+
+---
+
+## 1. 计划总览
+
+```
+Phase 1: 只读 MVP (模式 A: 直查对象存储)       3 周
+Phase 2: 性能优化 + Benchmark                   2 周
+Phase 3: 元数据引擎 (模式 B/C) + 写路径         3 周
+Phase 4: 生产化 (K8s DaemonSet + 监控)          2 周
+Phase 5: CSI Driver + PVC + K8s 深度集成        3 周
+Phase 6: 多后端扩展 (按需)                       按需
+```
+
+总工期：**13 周（约 3 个月）**，其中 Phase 1-4 为 MVP 到生产可用的核心路径（10 周），Phase 5 为 K8s 标准化部署（3 周）。
+
+### 关键里程碑
+
+| 里程碑 | Phase | 交付物 | 验收标准 |
+|--------|-------|--------|---------|
+| **M1: 能读** | Phase 1 | 可挂载的只读 FUSE 文件系统 | `ls` / `cat` 正常工作，缓存命中可验证 |
+| **M2: 读得快** | Phase 2 | 性能优化 + Benchmark 报告 | 缓存命中 P50 < 1ms，吞吐 > 2 GB/s |
+| **M3: 能写 + 跨节点** | Phase 3 | 写路径 + Redis/MySQL 元数据引擎 | 写后读一致，跨节点元数据共享 |
+| **M4: 可运维** | Phase 4 | systemd + K8s DaemonSet + 监控 | 7 天无故障运行，监控指标齐全 |
+| **M5: 标准 K8s** | Phase 5 | CSI Driver + PVC + 应用 Pod 透明挂载 | 标准 K8s 语义，PVC 挂载正常 |
+
+---
+
+## 2. Phase 1: 只读 MVP（3 周）
+
+> 目标：`fuel mount` 挂载后能 `ls` + `cat`，二次读命中本地缓存。模式 A（直查对象存储），无外部依赖。
+
+### Week 1: 项目骨架 + 核心类型 + 对象存储后端
+
+#### 1.1 项目初始化
+
+```
+任务: 创建 Go 项目骨架
+文件:
+  go.mod / go.sum
+  cmd/fuel/main.go          ← 入口, 子命令: mount / version
+  api/interfaces.go          ← ObjectStore / MetadataEngine / DataCache 接口 (见 IMPL_DESIGN §4)
+  api/types.go               ← MetaEntry / DirEntry / ObjectMeta / ObjectEntry / CacheStats / Config
+验证:
+  go mod init fuel
+  go mod tidy
+  go build ./cmd/fuel        ← 编译通过
+```
+
+#### 1.2 配置模块
+
+```
+任务: 实现配置加载
+文件:
+  internal/config/config.go  ← YAML 加载 + 环境变量覆盖 + 命令行参数
+  internal/config/config_test.go
+验证:
+  能加载 fuel-config.yaml
+  环境变量 FUEL_STORAGE_ACCESS_KEY / FUEL_STORAGE_ACCESS_SECRET 正确注入
+  命令行参数覆盖配置文件
+  go test ./internal/config/... 通过
+```
+
+#### 1.3 对象存储后端 (OSS)
+
+```
+任务: 实现对象存储 ObjectStore 接口
+文件:
+  internal/objectstore/factory.go  ← ObjectStoreFactory + RegisterObjectStore + NewObjectStore
+  internal/objectstore/oss.go      ← OSS 实现 (Head/Get/Put/List/Copy/Delete/Bucket)
+  internal/objectstore/mock.go     ← Mock 实现 (测试用)
+  internal/objectstore/retry.go    ← 重试 + 指数退避
+  internal/objectstore/oss_test.go ← 单元测试 (使用 mock)
+  internal/objectstore/oss_integration_test.go ← 集成测试 (build tag: integration)
+注意:
+  List 接口返回 ([]ObjectEntry, []string, error)，第二个返回值是 common prefixes（子目录）
+  Get 接口: length=0 表示读到末尾
+验证:
+  go test ./internal/objectstore/... 通过 (mock 测试)
+  go test -tags=integration ./internal/objectstore/... 通过 (真实对象存储)
+  Head / Get(Range) / List / Copy / Delete 行为正确
+  错误处理: 404 → ENOENT, 网络超时 → 重试, 403 → EACCES
+```
+
+### Week 2: 缓存层 + 元数据引擎 (模式 A)
+
+#### 2.1 元数据引擎接口 + 直查模式
+
+```
+任务: 实现 MetadataEngine 接口 + DirectEngine (模式 A)
+文件:
+  internal/metadata/factory.go     ← MetadataEngine 工厂
+  internal/metadata/direct.go      ← 模式 A: 直查对象存储 (调用 ObjectStore.Head / List)
+  internal/metadata/direct_test.go ← 单元测试
+注意:
+  ListDir 返回 []DirEntry（内联元数据），不是 []string
+  Invalidate 语义: 删除 path 及其所有子路径的缓存
+验证:
+  GetAttr / ListDir / SetAttr / Invalidate 行为正确
+  通过 ObjectStore 获取元数据
+  go test ./internal/metadata/... 通过
+```
+
+#### 2.2 数据缓存 (NVMe LRU)
+
+```
+任务: 实现 NVMe 数据缓存
+文件:
+  internal/cache/data.go         ← DataCache 实现 (Get/Put/Remove/Exists/Stats)
+  internal/cache/eviction.go     ← LRU 淘汰 (高低水位)
+  internal/cache/index.go        ← 缓存索引 (内存 map, MVP 不持久化)
+  internal/cache/data_test.go    ← 单元测试
+  internal/cache/eviction_test.go
+验证:
+  缓存文件路径 = {cache_dir}/{bucket}/{key} (INV-2)
+  缓存内容为对象字节镜像
+  ETag 校验: 匹配 → hit, 不匹配 → miss + 删除
+  LRU 淘汰: 超过高水位 → 删除最久未访问 → 低于低水位
+  go test ./internal/cache/... 通过
+```
+
+#### 2.3 元数据 L1 内存缓存
+
+```
+任务: 实现 L1 内存缓存 (TTL)
+文件:
+  internal/cache/meta.go         ← statCache + dirCache + negCache (TTL)
+  internal/cache/neg.go          ← 负缓存
+  internal/cache/meta_test.go    ← 单元测试
+验证:
+  stat 缓存 TTL 30s
+  dir 缓存 TTL 10s
+  负缓存 TTL 60s
+  过期自动失效
+  go test ./internal/cache/... 通过
+```
+
+### Week 3: FUSE 接口层 + 挂载 + 端到端验证
+
+#### 3.1 FUSE 接口层
+
+```
+任务: 实现 FUSE 接口层 (只读)
+文件:
+  internal/fuse/server.go        ← FUSE Server 生命周期 (New/Mount/Unmount/Wait)
+  internal/fuse/node.go          ← FuelRoot + FuelNode (fs.InodeEmbedder 实现)
+  internal/fuse/handle.go        ← fileHandle 管理 (读写状态)
+  internal/fuse/mount.go         ← 挂载参数 + 内核选项
+  internal/fuse/node_test.go     ← 单元测试 (mock 依赖)
+实现操作 (只读, 基于 go-fuse fs.InodeEmbedder API):
+  Getattr(path)         → MetaCache → MetadataEngine.GetAttr → 返回 POSIX stat
+  Lookup(parent, name)  → MetaCache → MetadataEngine.GetAttr → 返回 FuelNode
+  Open(path, READ)      → DataCache.Get → 命中返回 fd; 未命中暂不拉取
+  Read(fd, offset, size) → 缓存命中: pread(cacheFile); 未命中: singleflight 拉取整文件
+  Readdir(dir)          → MetaCache → MetadataEngine.ListDir → 返回 []DirEntry
+注意:
+  使用 go-fuse v2 fs.InodeEmbedder API（非 pathfs），参考 JuiceFS 实现
+  DataCache.Get/Put 返回本地文件路径，FUSE 层通过 pread 零拷贝读取
+  singleflight 去重并发缓存未命中拉取
+验证:
+  go test ./internal/fuse/... 通过 (mock ObjectStore + mock MetadataEngine)
+```
+
+#### 3.2 入口命令
+
+```
+任务: 实现 fuel mount 命令
+文件:
+  cmd/fuel/main.go               ← 入口
+  cmd/fuel/mount.go              ← mount 子命令
+  cmd/fuel/version.go            ← version 子命令
+验证:
+  fuel mount --config fuel-config.yaml 成功挂载
+  fuel version 输出版本信息
+```
+
+#### 3.3 端到端验证
+
+```
+任务: 端到端验证 (本地, 使用真实对象存储)
+验证标准 (ARCH_SPEC.md §11.2):
+  1. fuel mount 成功挂载
+  2. ls /fuel/{bucket}/ 能列目录
+  3. cat /fuel/{bucket}/path/to/file 能读文件
+  4. 二次读同一文件命中本地缓存 (通过日志确认)
+  5. ETag 变化后缓存自动失效
+测试数据:
+  在对象存储 bucket 中准备 100 个测试文件 (1KB-10MB)
+  在对象存储 bucket 中准备 1 个 1GB 大文件
+```
+
+### Phase 1 交付物清单
+
+```
+文件:
+  go.mod / go.sum
+  cmd/fuel/main.go / mount.go / version.go
+  api/interfaces.go / types.go
+  internal/config/config.go / config_test.go
+  internal/objectstore/factory.go / oss.go / mock.go / retry.go / oss_test.go
+  internal/metadata/factory.go / direct.go / direct_test.go
+  internal/cache/data.go / meta.go / eviction.go / index.go / *_test.go
+  internal/fuse/server.go / node.go / handle.go / mount.go / node_test.go
+
+验证:
+  全部单元测试通过: go test ./...
+  集成测试通过: go test -tags=integration ./internal/objectstore/...
+  端到端: ls + cat + 缓存命中 + ETag 失效
+
+预估代码量: ~3500 行
+```
+
+---
+
+## 3. Phase 2: 性能优化 + Benchmark（2 周）
+
+> 目标：缓存命中读延迟 P50 < 1ms，吞吐 > 2 GB/s。对比 Alluxio FUSE benchmark。
+
+### Week 4: 预读 + 并发拉取 + 小文件优化
+
+#### 4.1 预读策略
+
+```
+任务: 实现顺序读检测 + 倍增预读
+文件:
+  internal/cache/prefetch.go     ← 预读器
+  internal/cache/prefetch_test.go
+逻辑:
+  顺序读检测: 连续 read 的 offset 递增
+  倍增预读: 1MB → 2MB → 4MB → 8MB → 16MB 封顶
+  乱序读检测: numOOORead > 3 时禁用预读 (借鉴 goofys)
+  异步预读: 后台 goroutine GET Range + 写缓存
+验证:
+  go test ./internal/cache/... 通过
+  顺序读文件时预读触发
+  乱序读时预读自动禁用
+```
+
+#### 4.2 并发拉取
+
+```
+任务: 大文件多 block 并发 GET Range
+文件:
+  internal/cache/prefetch.go     ← 并发拉取逻辑
+逻辑:
+  缓存未命中大文件 (> blockSize) 时, 按 4MB block 并发拉取
+  并发度 = config.prefetch.concurrency (默认 4)
+  每个 goroutine GET Range [blockStart, blockEnd)
+  全部完成后 rename 临时文件为正式缓存
+验证:
+  100MB 文件拉取时间 ≤ 单线程 1/4 (理想情况)
+  go test ./internal/cache/... 通过
+```
+
+#### 4.3 小文件批量预取 + 元数据批量预取
+
+```
+任务: 小文件批量预取 + readdir 元数据并行预取
+文件:
+  internal/cache/prefetch.go     ← 批量预取
+  internal/fuse/ops.go           ← readdir 时并行预取 stat
+逻辑:
+  检测连续小文件读 (同目录) → 批量预取后续文件
+  readdir 时, 对目录下所有文件并行 HEAD 预取元数据
+验证:
+  连续读 10 个小文件时, 后续 3-10 个自动预取
+  readdir 后目录下文件 stat 延迟 < 1ms (L1 命中)
+```
+
+#### 4.4 FUSE 内核参数调优
+
+```
+任务: 挂载参数优化
+文件:
+  internal/fuse/mount.go         ← 挂载参数
+参数:
+  MaxRead:      1 << 20          # 1MB 单次读
+  MaxBackground: 128              # 后台请求队列
+  Options:      large_read, kernel_cache, auto_cache
+验证:
+  benchmark 前后对比读吞吐
+```
+
+### Week 5: BufferPool + Benchmark
+
+#### 5.1 BufferPool 内存管理
+
+```
+任务: 实现 BufferPool (借鉴 goofys, cgroup 感知)
+文件:
+  internal/cache/buffer.go       ← BufferPool (sync.Pool, 5MB)
+  internal/cache/buffer_test.go
+逻辑:
+  sync.Pool 复用 5MB buffer
+  cgroup 感知: 读取容器内存限制, 动态调整 buffer 池大小
+验证:
+  go test ./internal/cache/... 通过
+  内存使用不超过配置上限
+```
+
+#### 5.2 Benchmark
+
+```
+任务: 性能 benchmark, 对比 Alluxio FUSE
+文件:
+  internal/benchmark/read_test.go      ← 读 benchmark
+  internal/benchmark/meta_test.go      ← 元数据 benchmark
+测试场景 (ARCH_SPEC.md §GOAL-2/3/4):
+  场景 1: 海量小文件顺序读 (10K files, 100KB each)
+    指标: 吞吐 / 延迟 P50 / P99
+  场景 2: 大文件顺序读 (1GB file)
+    指标: 吞吐
+  场景 3: 多并发读 (8 并发, 同数据集)
+    指标: 吞吐 / 延迟 P99
+  场景 4: 缓存命中二次读
+    指标: 延迟 P50
+  场景 5: 首次冷启动读 (cache miss)
+    指标: 吞吐
+  场景 6: 元数据操作 (stat 10K files)
+    指标: 耗时
+  场景 7: 目录列表 (readdir 1K files)
+    指标: 耗时
+验证标准:
+  缓存命中读延迟 P50 < 1ms (GOAL-2)
+  缓存命中读延迟 P99 < 5ms
+  顺序读吞吐 > 2 GB/s (GOAL-2)
+  缓存命中率 > 90% (热数据 < NVMe 70%) (GOAL-4)
+  缓存未命中读延迟 P50 < 50ms (GOAL-3)
+  元数据 stat P50 < 5ms (L1 命中) (GOAL-2)
+产出:
+  benchmark 报告 (含与 Alluxio FUSE 的对比数据)
+```
+
+### Phase 2 交付物清单
+
+```
+文件:
+  internal/cache/prefetch.go / prefetch_test.go
+  internal/cache/buffer.go / buffer_test.go
+  internal/benchmark/read_test.go / meta_test.go
+  benchmark 报告
+
+预估新增代码量: ~1500 行
+```
+
+---
+
+## 4. Phase 3: 元数据引擎 + 写路径（3 周）
+
+> 目标：Redis/MySQL 元数据引擎跨节点共享，写路径完成（PutObject + 缓存失效），写后读一致。
+
+### Week 6: Redis 元数据引擎
+
+#### 6.1 Redis Engine
+
+```
+任务: 实现 Redis MetadataEngine
+文件:
+  internal/metadata/redis.go       ← RedisEngine 实现
+  internal/metadata/redis_test.go  ← 单元测试 (使用 miniredis 或 mock)
+逻辑:
+  Key 设计:
+    meta:{bucket}/{path}  → JSON MetaEntry (不过期, 写路径主动删)
+    dir:{bucket}/{dir}/   → Hash 子项列表 (不过期, 写路径主动删)
+    neg:{bucket}/{path}   → "1" (TTL 60s)
+  读: Redis GET → hit: 返回; miss: ObjectStore.Head → 写回 Redis + L1
+  写: PutObject 后 → SET meta + DEL neg + 失效 dir 缓存
+  跨节点共享: 所有节点读同一 Redis
+验证:
+  go test ./internal/metadata/... 通过
+  Redis 元数据回填: 首次 HEAD 对象存储 → 写入 Redis → 二次读 Redis 命中
+  跨节点: 节点 A 写入后, 节点 B 可读到
+```
+
+### Week 7: MySQL 元数据引擎
+
+#### 7.1 MySQL Engine
+
+```
+任务: 实现 MySQL MetadataEngine
+文件:
+  internal/metadata/mysql.go       ← MysqlEngine 实现
+  internal/metadata/mysql_test.go  ← 单元测试 (使用 sqlmock 或测试 MySQL)
+  internal/metadata/schema.sql     ← 建表语句
+表结构:
+  fuel_inodes (id, path, bucket, size, etag, mtime, is_dir, content_type, created_at, updated_at)
+  fuel_dentries (id, parent_path, name, inode_id)
+逻辑:
+  读: SELECT → hit: 返回; miss: ObjectStore.Head → INSERT/UPSERT → 返回
+  写: PutObject 后 → UPSERT + DELETE dentry + 失效 dentry 缓存
+  持久化: 进程重启后元数据不丢失
+验证:
+  go test ./internal/metadata/... 通过
+  MySQL 元数据回填和持久化
+  跨节点: 节点 A 写入后, 节点 B 可读到
+  FUSE 进程重启后元数据不丢失
+```
+
+### Week 8: 写路径 + 一致性验证
+
+#### 8.1 写路径实现
+
+```
+任务: 实现 FUSE 写路径
+文件:
+  internal/fuse/ops.go             ← 写操作实现
+新增操作:
+  Create(path)     → 创建 FileHandle (dirty=true)
+  Write(fd, data)  → 写本地临时文件
+  Flush(fd)        → 临时文件 PutObject → 失效 L1 + L2 + 数据缓存
+  Fsync(fd)        → 同 Flush
+  Unlink(path)     → ObjectStore.Delete → 失效缓存
+  Rename(old, new) → ObjectStore.Copy + Delete → 失效两端缓存
+  Mkdir(dir)       → ObjectStore.Put 零字节占位对象
+  Rmdir(dir)       → ObjectStore.Delete 占位对象
+验证:
+  写文件 → 立即读 → 读到最新数据
+  写文件 → 跨节点读 → 读到最新数据 (L2 引擎共享)
+  删除文件 → 读 → ENOENT
+  go test ./internal/fuse/... 通过
+```
+
+#### 8.2 写后读一致性验证
+
+```
+任务: 端到端写后读一致性测试
+文件:
+  internal/fuse/write_test.go    ← 写后读一致性测试
+测试场景:
+  场景 1: 写文件 → 同节点立即读 → 读到新数据
+  场景 2: 写文件 → 同节点 L1 TTL 过期后读 → 读到新数据
+  场景 3: 写文件 → 跨节点读 (模式 B Redis) → 读到新数据
+  场景 4: 覆盖写 → 缓存失效 → 读到新数据
+  场景 5: 删除 → 读到 ENOENT
+  场景 6: rename → 旧路径 ENOENT, 新路径可读
+  场景 7: mkdir → readdir 可见
+  场景 8: rmdir → readdir 不可见
+验证标准 (ARCH_SPEC.md §7):
+  单节点写后读: 强一致
+  跨节点写后读: 最终一致 (L1 TTL 过期后)
+```
+
+#### 8.3 元数据引擎模式切换验证
+
+```
+任务: 验证三种模式可切换
+测试:
+  模式 A (direct) → 模式 B (redis) → 模式 C (mysql) 切换
+  切换后 FUSE 行为一致
+  切换后数据不变
+  元数据引擎不可用时自动降级
+```
+
+### Phase 3 交付物清单
+
+```
+文件:
+  internal/metadata/redis.go / redis_test.go
+  internal/metadata/mysql.go / mysql_test.go / schema.sql
+  internal/fuse/ops.go (扩展写操作)
+  internal/fuse/write_test.go
+
+验证:
+  Redis 元数据引擎跨节点共享
+  MySQL 元数据持久化 + 重启恢复
+  写路径完整 (create/write/flush/unlink/rename/mkdir/rmdir)
+  写后读一致性 (单节点强一致, 跨节点最终一致)
+  模式切换验证
+
+预估新增代码量: ~2500 行
+```
+
+---
+
+## 5. Phase 4: 生产化 — K8s DaemonSet + 监控（2 周）
+
+> 目标：systemd + K8s DaemonSet 部署 + Prometheus 监控 + 故障恢复。7 天无故障运行。
+
+### Week 9: 监控 + 日志 + 健康检查
+
+#### 9.1 Prometheus 指标
+
+```
+任务: 实现全部监控指标
+文件:
+  internal/monitor/metrics.go      ← 指标定义 + 采集
+  internal/monitor/health.go       ← 健康检查端点
+指标 (ARCH_SPEC.md §9.1):
+  fuel_cache_hit_total{type="data"}
+  fuel_cache_miss_total{type="data"}
+  fuel_cache_size_bytes / fuel_cache_capacity_bytes
+  fuel_cache_eviction_total
+  fuel_meta_hit_total{layer="l1/l2"} / fuel_meta_miss_total
+  fuel_neg_cache_hit_total
+  fuel_storage_requests_total{backend,operation}
+  fuel_storage_request_duration_seconds{backend,operation}
+  fuel_fuse_read_duration_seconds
+  fuel_fuse_operations_total{op}
+  fuel_prefetch_total / fuel_prefetch_bytes_total
+  fuel_process_memory_bytes / fuel_process_goroutine_count
+健康检查:
+  GET /health → 200 OK / 503 (元数据引擎不可达)
+验证:
+  curl localhost:49999/metrics 返回全部指标
+  curl localhost:49999/health 返回 200
+```
+
+#### 9.2 日志体系
+
+```
+任务: zap 结构化日志
+文件:
+  internal/monitor/log.go          ← zap 日志初始化
+  全部模块接入 zap 日志
+规范 (AGENTS.md §3.4):
+  INFO: 挂载/卸载、缓存淘汰、对象存储请求重试
+  WARN: 对象存储请求失败重试、缓存校验失败、元数据引擎降级
+  ERROR: 对象存储请求最终失败、FUSE 操作错误
+  DEBUG: 每次 read/write 的缓存命中/未命中
+验证:
+  日志格式为结构化 JSON
+  关键事件有日志记录
+```
+
+### Week 10: systemd + K8s DaemonSet + 故障恢复测试
+
+#### 10.1 systemd 服务
+
+```
+任务: systemd unit 文件 + 安装脚本
+文件:
+  deploy/systemd/fuel.service      ← systemd unit
+验证:
+  systemctl start fuel → 挂载成功
+  systemctl restart fuel → 缓存索引重建 (MVP: 扫描重建)
+  systemctl status fuel → 运行状态正常
+```
+
+#### 10.2 K8s DaemonSet 部署
+
+```
+任务: K8s DaemonSet YAML + ConfigMap + Secret
+文件:
+  deploy/k8s/daemonset.yaml        ← Fuel FUSE DaemonSet
+  deploy/k8s/configmap.yaml       ← 配置
+  deploy/k8s/secret.yaml          ← 凭证 (CI 注入)
+验证:
+  kubectl apply -f deploy/k8s/ → DaemonSet 正常启动
+  FUSE 挂载点可用
+  Prometheus 抓取指标正常
+  livenessProbe /health 通过
+```
+
+#### 10.3 故障恢复测试
+
+```
+任务: 端到端故障恢复测试
+文件:
+  internal/fuse/failure_test.go    ← 故障恢复测试
+测试场景 (ARCH_SPEC.md §GOAL-7):
+  场景 1: FUSE 进程崩溃 → systemd/K8s 自动重启 → 缓存索引重建
+  场景 2: 元数据引擎 (Redis) 宕机 → L1 缓存可用 → 降级为直查对象存储
+  场景 3: 元数据引擎 (MySQL) 宕机 → 同上
+  场景 4: 对象存储网络不可达 → 已缓存数据正常读 → 未缓存返回 EIO
+  场景 5: 磁盘空间不足 → LRU 淘汰 → 降级为不缓存
+  场景 6: 缓存索引持久化恢复 (BoltDB, 如果 Phase 4 实现)
+验证标准:
+  所有场景下功能正常 (仅性能降级)
+  无 panic, 无数据丢失
+  监控告警触发正常
+```
+
+#### 10.4 缓存索引持久化 (可选)
+
+```
+任务: BoltDB 缓存索引持久化
+文件:
+  internal/cache/index.go          ← BoltDB 持久化
+逻辑:
+  定期持久化 LRU 索引到 BoltDB
+  重启时加载索引, 跳过全量扫描
+验证:
+  重启后缓存索引秒级恢复
+```
+
+### Phase 4 交付物清单
+
+```
+文件:
+  internal/monitor/metrics.go / health.go / log.go
+  deploy/systemd/fuel.service
+  deploy/k8s/daemonset.yaml / configmap.yaml / secret.yaml
+  internal/fuse/failure_test.go
+  internal/cache/index.go (BoltDB 持久化, 可选)
+
+验证:
+  Prometheus 指标齐全
+  systemd 部署正常
+  K8s DaemonSet 部署正常
+  故障恢复测试全部通过
+  7 天无故障运行 (预生产)
+
+预估新增代码量: ~1500 行
+```
+
+---
+
+## 6. Phase 5: CSI Driver + PVC + K8s 深度集成（3 周）
+
+> 目标：标准 K8s CSI 语义，应用 Pod 通过 PVC 透明挂载。
+
+### Week 11: CSI Driver 核心实现
+
+#### 11.1 CSI Driver
+
+```
+任务: 实现 CSI IdentityServer + ControllerServer + NodeServer
+文件:
+  internal/deploy/csi.go            ← CSI Driver 核心
+  internal/deploy/csi_server.go     ← CSI gRPC server
+  internal/deploy/csi_test.go       ← 单元测试
+实现 (ARCH_SPEC.md §10.4.3):
+  IdentityServer:
+    GetPluginInfo → 返回 driverName=csi.fuel.io
+    GetPluginCapabilities
+    Probe → 检查 FUSE 挂载点
+  ControllerServer:
+    CreateVolume → 创建虚拟 PV 对象
+    DeleteVolume → 删除 PV 对象
+  NodeServer:
+    NodePublishVolume → bind-mount /fuel/{bucket} → Pod targetPath
+    NodeUnpublishVolume → unmount
+    NodeGetCapabilities
+验证:
+  go test ./internal/deploy/... 通过
+  CSI 接口契约正确
+```
+
+### Week 12: CSI 部署清单 + 端到端验证
+
+#### 12.1 K8s 部署清单
+
+```
+任务: CSI Driver 全部 K8s YAML
+文件:
+  deploy/k8s/csi-driver.yaml        ← CSIDriver CRD + RBAC
+  deploy/k8s/csi-controller.yaml    ← CSI Controller Deployment
+  deploy/k8s/csi-nodeplugin.yaml    ← CSI NodePlugin DaemonSet
+  deploy/k8s/storageclass.yaml      ← StorageClass
+验证:
+  kubectl apply -f deploy/k8s/csi-*.yaml → 全部正常启动
+  kubectl get csidrivers → csi.fuel.io 注册成功
+  kubectl get pods -n fuel-system → 全部 Running
+```
+
+#### 12.2 PVC 挂载端到端验证
+
+```
+任务: 应用 Pod 通过 PVC 挂载
+文件:
+  deploy/k8s/example-pvc.yaml       ← 示例 PVC
+  deploy/k8s/example-job.yaml       ← 示例应用 Pod
+验证标准:
+  创建 PVC (storageClassName: fuel-csi)
+  创建应用 Pod (引用 PVC)
+  Pod 内 ls /data/ 能列目录
+  Pod 内 cat /data/file 能读文件
+  Pod 内读命中缓存 (通过 FUSE 日志确认)
+  CSI 挂载和卸载正常 (Pod 创建/删除)
+```
+
+### Week 13: Sidecar 模式 + 数据感知调度
+
+#### 13.1 Sidecar 模式
+
+```
+任务: Sidecar 部署模式验证
+文件:
+  deploy/k8s/example-sidecar.yaml   ← Sidecar 示例 Pod
+验证:
+  Sidecar 容器中的 FUSE 挂载正常
+  应用容器通过 emptyDir 访问 FUSE 挂载点
+  Pod 级隔离 (FUSE 崩溃只影响本 Pod)
+```
+
+#### 13.2 数据感知调度
+
+```
+任务: 节点标签 + Pod 亲和性调度
+验证:
+  kubectl label nodes → fuel.io/fuse=enabled
+  Pod 亲和性配置 → 调度到有 FUSE 的节点
+  无 FUSE 的节点不被调度
+```
+
+### Phase 5 交付物清单
+
+```
+文件:
+  internal/deploy/csi.go / csi_server.go / csi_test.go
+  deploy/k8s/csi-driver.yaml / csi-controller.yaml / csi-nodeplugin.yaml
+  deploy/k8s/storageclass.yaml / example-pvc.yaml / example-job.yaml / example-sidecar.yaml
+
+验证:
+  CSI Driver 注册成功
+  PVC 挂载正常工作
+  应用 Pod 透明访问对象存储数据
+  Sidecar 模式正常
+  数据感知调度正常
+
+预估新增代码量: ~1200 行
+```
+
+---
+
+## 7. Phase 6: 多后端扩展（按需）
+
+> 目标：按需实现 S3 / MinIO 后端。架构已支持（INV-8），仅需实现 `ObjectStore` 接口。
+
+### 按需触发条件
+
+- 有明确的 S3 或 MinIO 使用需求
+- OSS 后端已稳定运行
+- Phase 1-5 全部完成
+
+### 实施步骤（以 S3 为例）
+
+```
+1. 创建 internal/objectstore/s3.go
+2. 引入 AWS SDK v2 (github.com/aws/aws-sdk-go-v2)
+3. 实现 ObjectStore 接口全部方法
+4. init() 中注册: api.RegisterObjectStore("s3", NewS3Store)
+5. 在 StorageConfig 中添加 S3 配置段
+6. 编写单元测试 (mock + LocalStack)
+7. 验证: storage.type=s3 时挂载和读写正常
+
+预估工作量: 1-2 周 (单后端)
+预估代码量: ~600 行
+```
+
+---
+
+## 8. 风险与依赖
+
+### 8.1 技术风险
+
+| 风险 | 影响 | 缓解 | Phase |
+|------|------|------|-------|
+| FUSE 库学习曲线 | Phase 1 工期延误 | hanwen/go-fuse 有 JuiceFS 生产验证，参考 JuiceFS 源码 | Phase 1 |
+| OSS SDK 行为差异 | 集成测试失败 | 集成测试提前跑 (Phase 1 Week 1)，暴露问题 | Phase 1 |
+| 缓存命中率不达预期 | Benchmark 不达标 | 分析热数据集大小 vs NVMe 容量，调整淘汰策略 | Phase 2 |
+| Redis/MySQL 连接不稳定 | 元数据引擎故障 | 降级为直查对象存储 (INV-4 保证)，重试 + 告警 | Phase 3-4 |
+| CSI bind-mount 权限问题 | PVC 挂载失败 | privileged + mountPropagation: Bidirectional | Phase 5 |
+| 海量小文件 List 慢 | readdir 延迟高 | 短 TTL 目录缓存 + 元数据引擎缓存 | Phase 2-3 |
+
+### 8.2 外部依赖
+
+| 依赖 | 阶段 | 准备事项 |
+|------|------|---------|
+| 阿里云 OSS bucket + AK/SK | Phase 1 | 提前创建测试 bucket，准备 AK/SK |
+| Redis 实例 | Phase 3 | 准备测试 Redis (本地或云) |
+| MySQL 实例 | Phase 3 | 准备测试 MySQL (本地或云) |
+| K8s 集群 | Phase 4-5 | 准备测试集群 (1.18+), 节点打标签 |
+| Alluxio FUSE 基线 | Phase 2 | 现有 Alluxio 部署，用于 benchmark 对比 |
+
+### 8.3 人员建议
+
+| Phase | 建议人力 | 关键技能 |
+|-------|---------|---------|
+| Phase 1-2 | 1-2 人 | Go + FUSE + 对象存储 |
+| Phase 3 | 1-2 人 | Go + Redis/MySQL |
+| Phase 4-5 | 1-2 人 | Go + K8s + CSI |
+
+---
+
+## 9. 文件交付汇总
+
+```
+Phase 1 交付 (Week 1-3):
+  cmd/fuel/main.go / mount.go / version.go
+  api/interfaces.go / types.go
+  internal/config/config.go / config_test.go
+  internal/objectstore/store.go / oss.go / mock.go / oss_test.go
+  internal/metadata/engine.go / direct.go / types.go / direct_test.go
+  internal/cache/data.go / meta.go / neg.go / eviction.go / index.go / *_test.go
+  internal/fuse/fuse.go / ops.go / handle.go / mount.go / ops_test.go
+  ~3500 行
+
+Phase 2 交付 (Week 4-5):
+  internal/cache/prefetch.go / prefetch_test.go
+  internal/cache/buffer.go / buffer_test.go
+  internal/benchmark/read_test.go / meta_test.go
+  benchmark 报告
+  ~1500 行
+
+Phase 3 交付 (Week 6-8):
+  internal/metadata/redis.go / redis_test.go
+  internal/metadata/mysql.go / mysql_test.go / schema.sql
+  internal/fuse/ops.go (扩展写操作) / write_test.go
+  ~2500 行
+
+Phase 4 交付 (Week 9-10):
+  internal/monitor/metrics.go / health.go / log.go
+  deploy/systemd/fuel.service
+  deploy/k8s/daemonset.yaml / configmap.yaml / secret.yaml
+  internal/fuse/failure_test.go
+  internal/cache/index.go (BoltDB, 可选)
+  ~1500 行
+
+Phase 5 交付 (Week 11-13):
+  internal/deploy/csi.go / csi_server.go / csi_test.go
+  deploy/k8s/csi-driver.yaml / csi-controller.yaml / csi-nodeplugin.yaml
+  deploy/k8s/storageclass.yaml / example-*.yaml
+  ~1200 行
+
+总计预估代码量: ~10200 行
+```
+
+---
+
+## 10. 与 ARCH_SPEC.md 的对齐
+
+| ARCH_SPEC 章节 | 对应 Phase | 说明 |
+|----------------|-----------|------|
+| §4.2 模块分解 | Phase 1 | 项目骨架按此结构创建 |
+| §4.3 核心接口 | Phase 1 | ObjectStore / MetadataEngine / DataCache 接口实现 |
+| §4.4 数据流 | Phase 1 (读) / Phase 3 (写) | 读路径 Phase 1, 写路径 Phase 3 |
+| §5 技术栈 | Phase 1 | go.mod 按此引入依赖 |
+| §6 路径映射 | Phase 1 | 路径格式按此实现 |
+| §7 一致性模型 | Phase 3 | 写后读一致性验证 |
+| §8 配置规范 | Phase 1 | 配置结构体按此定义 |
+| §9 监控规范 | Phase 4 | Prometheus 指标按此实现 |
+| §10.1 本地部署 | Phase 4 | systemd 部署 |
+| §10.4 CSI Driver | Phase 5 | CSI Driver 实现 |
+| §11.2 Phase 1 验证标准 | Phase 1 | 最小验证标准 |
+| §11.3 不做过度设计 | 全部 Phase | 每个 Phase 遵守 |
+| GOAL-1 POSIX | Phase 1-3 | 逐步实现操作 |
+| GOAL-2 缓存命中性能 | Phase 2 | Benchmark 验证 |
+| GOAL-3 回源性能 | Phase 2 | Benchmark 验证 |
+| GOAL-4 缓存命中率 | Phase 2 | Benchmark 验证 |
+| GOAL-5 双模部署 | Phase 4-5 | systemd + K8s |
+| GOAL-6 可观测性 | Phase 4 | 监控指标 |
+| GOAL-7 故障降级 | Phase 4 | 故障恢复测试 |
+| GOAL-8 可维护性 | 全部 Phase | 接口隔离 + 测试 |
