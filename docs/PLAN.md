@@ -37,7 +37,10 @@ Phase 6: 多后端扩展 (按需)                       按需
 
 ### Week 1: 项目骨架 + 核心类型 + 对象存储后端
 
-#### 1.1 项目初始化
+> ✅ **已完成**（2026-08-15）。单元测试全部通过：`go test ./...`（api 100% / config 95.8% / objectstore 64.2%，objectstore 未覆盖部分为真实 OSS I/O，需集成测试覆盖）。
+> 实现差异已同步至 IMPL_DESIGN/ARCH_SPEC：配置用 yaml.v3 而非 viper，命令框架用标准库 flag 而非 cobra，环境变量 OSS_* 与 FUEL_STORAGE_* 双兼容。
+
+#### 1.1 项目初始化 ✅
 
 ```
 任务: 创建 Go 项目骨架
@@ -52,7 +55,9 @@ Phase 6: 多后端扩展 (按需)                       按需
   go build ./cmd/fuel        ← 编译通过
 ```
 
-#### 1.2 配置模块
+**实际交付**: `go.mod`/`go.sum`、`cmd/fuel/main.go`（flag 子命令：mount/version）、`cmd/fuel/mount.go`（mount 骨架，FUSE 挂载留待 Week 3）、`api/interfaces.go`、`api/types.go`（含 `InodeFromPath`/`MetaEntryFromObjectMeta`/`DirMetaEntry` 及测试）。`fuel version`/`fuel mount` 可运行。
+
+#### 1.2 配置模块 ✅
 
 ```
 任务: 实现配置加载
@@ -61,12 +66,14 @@ Phase 6: 多后端扩展 (按需)                       按需
   internal/config/config_test.go
 验证:
   能加载 fuel-config.yaml
-  环境变量 FUEL_STORAGE_ACCESS_KEY / FUEL_STORAGE_ACCESS_SECRET 正确注入
+  环境变量 OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET (或 FUEL_STORAGE_ACCESS_KEY / FUEL_STORAGE_ACCESS_SECRET) 正确注入
   命令行参数覆盖配置文件
   go test ./internal/config/... 通过
 ```
 
-#### 1.3 对象存储后端 (OSS)
+**实际交付**: `internal/config/config.go`（yaml.v3 加载 + 默认值 + 环境变量注入 + 必填校验），测试覆盖 95.8%。AK/SK 双变量兼容，`OSS_*` 优先。
+
+#### 1.3 对象存储后端 (OSS) ✅
 
 ```
 任务: 实现对象存储 ObjectStore 接口
@@ -77,6 +84,7 @@ Phase 6: 多后端扩展 (按需)                       按需
   internal/objectstore/retry.go    ← 重试 + 指数退避
   internal/objectstore/oss_test.go ← 单元测试 (使用 mock)
   internal/objectstore/oss_integration_test.go ← 集成测试 (build tag: integration)
+  internal/objectstore/retry_test.go ← 重试单元测试
 注意:
   List 接口返回 ([]ObjectEntry, []string, error)，第二个返回值是 common prefixes（子目录）
   Get 接口: length=0 表示读到末尾
@@ -86,6 +94,8 @@ Phase 6: 多后端扩展 (按需)                       按需
   Head / Get(Range) / List / Copy / Delete 行为正确
   错误处理: 404 → ENOENT, 网络超时 → 重试, 403 → EACCES
 ```
+
+**实际交付**: 全部文件就绪。额外修复一个 bug：`isRetryable` 曾把 `syscall.Errno`（如 ENOENT/EACCES，实现了 `net.Error.Timeout()`）误判为可重试网络错误，已在 net.Error 判定前排除 errno。单元测试通过（含 mock 契约、错误映射、重试逻辑）。
 
 ### Week 2: 缓存层 + 元数据引擎 (模式 A)
 

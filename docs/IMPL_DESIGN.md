@@ -689,11 +689,15 @@ type MonitorConfig struct {
 ### 8.3 敏感信息（不入配置文件）
 
 ```
-OSS_ACCESS_KEY_ID          # 对象存储 AK
-OSS_ACCESS_KEY_SECRET      # 对象存储 SK
+OSS_ACCESS_KEY_ID          # 对象存储 AK（优先）
+OSS_ACCESS_KEY_SECRET      # 对象存储 SK（优先）
+FUEL_STORAGE_ACCESS_KEY    # 对象存储 AK（兼容回退）
+FUEL_STORAGE_ACCESS_SECRET # 对象存储 SK（兼容回退）
 FUEL_REDIS_PASSWORD        # Redis 密码
 FUEL_MYSQL_PASSWORD        # MySQL 密码
 ```
+
+> 实现说明（`internal/config/config.go`）: `OSS_*` 与 `FUEL_STORAGE_*` 两组变量均支持，`OSS_*` 优先。同时兼容 OSS SDK 惯例命名与项目统一命名。
 
 ### 8.4 配置优先级
 
@@ -759,7 +763,7 @@ fuel/
 │   ├── interfaces.go          # ObjectStore / MetadataEngine / DataCache / MetaCache
 │   └── types.go               # MetaEntry / DirEntry / ObjectMeta / ObjectEntry / CacheStats / Config
 ├── cmd/fuel/
-│   ├── main.go                # 入口, cobra 命令注册
+│   ├── main.go                # 入口, 标准库 flag 子命令分发
 │   ├── mount.go               # mount 子命令, 依赖组装
 │   └── version.go             # version 子命令
 ├── internal/
@@ -782,9 +786,10 @@ fuel/
 │   │   ├── oss.go             # OSS 后端实现
 │   │   ├── mock.go            # Mock 实现 (测试用)
 │   │   ├── retry.go           # 重试 + 指数退避
+│   │   ├── retry_test.go      # 重试单元测试
 │   │   └── factory.go         # ObjectStore 工厂函数 + 注册表
 │   ├── config/
-│   │   └── config.go          # 配置加载 (viper)
+│   │   └── config.go          # 配置加载 (yaml.v3 + 环境变量覆盖)
 │   └── monitor/
 │       ├── metrics.go         # Prometheus 指标定义 + 采集
 │       └── health.go          # /health 端点

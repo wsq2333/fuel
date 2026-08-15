@@ -26,6 +26,7 @@ Fuel 是一个面向对象存储的高性能 POSIX 缓存文件系统，在数�
 - FUSE 库：`github.com/hanwen/go-fuse/v2`
 - OSS SDK：`github.com/aliyun/aliyun-oss-go-sdk/oss`
 - 元数据引擎（可选）：Redis (`github.com/redis/go-redis/v9`) / MySQL (`github.com/go-sql-driver/mysql`)
+- 配置：`gopkg.in/yaml.v3`
 - 监控：`github.com/prometheus/client_golang`
 - 日志：`go.uber.org/zap`
 

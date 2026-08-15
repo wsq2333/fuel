@@ -421,7 +421,7 @@ stat(path)
 | Redis 客户端 | `github.com/redis/go-redis/v9` | 元数据引擎模式 B |
 | MySQL 驱动 | `github.com/go-sql-driver/mysql` | 元数据引擎模式 C |
 | 监控 | `github.com/prometheus/client_golang` | 与现有监控体系一致 |
-| 配置 | `github.com/spf13/viper` | YAML + 环境变量 + 命令行 |
+| 配置 | `gopkg.in/yaml.v3` | YAML + 环境变量 + 命令行（未引入 viper，符合 §11.3 不过度设计） |
 | 日志 | `go.uber.org/zap` | 高性能结构化日志 |
 | 缓存索引 | `go.etcd.io/bbolt` (可选) | LRU 索引持久化，嵌入式 KV |
 
