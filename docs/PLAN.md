@@ -99,7 +99,7 @@ Phase 6: 多后端扩展 (按需)                       按需
 
 ### Week 2: 缓存层 + 元数据引擎 (模式 A)
 
-#### 2.1 元数据引擎接口 + 直查模式
+#### 2.1 元数据引擎接口 + 直查模式 ✅
 
 ```
 任务: 实现 MetadataEngine 接口 + DirectEngine (模式 A)
@@ -115,6 +115,15 @@ Phase 6: 多后端扩展 (按需)                       按需
   通过 ObjectStore 获取元数据
   go test ./internal/metadata/... 通过
 ```
+
+**实际交付**（2026-08-15）: `factory.go`（`MetadataEngineFactory` + `RegisterMetadataEngine` + `NewMetadataEngine`，签名带 `ObjectStore` 依赖以支持直查/降级）、`direct.go`、`direct_test.go`。测试覆盖 94.4%。
+
+**实现要点**:
+- `GetAttr` 目录推断顺序（ARCH_SPEC §6.3）: 根 → HEAD key（文件）→ HEAD `key/`（显式目录标记）→ List `key/` 有子项（隐式目录）→ 否则 ENOENT。路径经 `normalizeKey` 去前导/尾部 `/`。
+- `ListDir` 用 `List(prefix, delimiter="/")` 一次取文件 + 子目录前缀，内联 `MetaEntry`（预填充 L1，避免 N+1 HEAD）；过滤掉 `key/` 形式的目录标记对象。
+- `SetAttr/SetDir/DeleteAttr/DeleteDir/Invalidate/Close` 为 no-op（direct 无本地存储，直查即最新）。
+- `HealthCheck` 通过 bucket 根 `List(maxKeys=1)` 探测可达性。
+- 错误传播：Head/List 的非 ENOENT 错误（EACCES/EIO）原样包装上传，仅 ENOENT 触发目录推断链。
 
 #### 2.2 数据缓存 (NVMe LRU)
 

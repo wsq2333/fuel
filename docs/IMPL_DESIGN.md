@@ -294,6 +294,8 @@ type MetadataEngine interface {
     fuel_dir  (dir_path, child_name, is_dir, size, etag, mtime)
 ```
 
+**工厂签名**: `MetadataEngineFactory = func(cfg *config.Config, store api.ObjectStore) (api.MetadataEngine, error)`。工厂除 `cfg` 外还接收 `store`——direct 模式直查对象存储、redis/mysql 健康检查失败时降级为 direct，都需要 `ObjectStore` 依赖。`NewMetadataEngine(cfg, store)` 按 `cfg.Metadata.Engine` 选择实现。
+
 ### 4.3 DataCache — 数据缓存
 
 ```go
@@ -779,8 +781,9 @@ fuel/
 │   │   └── index.go           # 缓存索引 (内存 map, 可选 BoltDB 持久化)
 │   ├── metadata/
 │   │   ├── direct.go          # 模式 A: 直查 ObjectStore
-│   │   ├── redis.go           # 模式 B: Redis
-│   │   ├── mysql.go           # 模式 C: MySQL
+│   │   ├── direct_test.go     # direct 单元测试 (mock ObjectStore)
+│   │   ├── redis.go           # 模式 B: Redis (Phase 3)
+│   │   ├── mysql.go           # 模式 C: MySQL (Phase 3)
 │   │   └── factory.go         # MetadataEngine 工厂函数
 │   ├── objectstore/
 │   │   ├── oss.go             # OSS 后端实现
