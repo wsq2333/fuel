@@ -13,7 +13,7 @@
 
 ### 1.1 一句话定义
 
-**Fuel 是一个面向对象存储的高性能 POSIX 缓存文件系统，在数据消费集群提供本地 NVMe 缓存加速，通过 FUSE 接口对训练应用透明暴露。**
+**Fuel 是一个面向OSS 的高性能 POSIX 缓存文件系统，在数据消费集群提供本地 NVMe 缓存加速，通过 FUSE 接口对训练应用透明暴露。**
 
 ### 1.2 是什么
 
@@ -25,17 +25,17 @@
 
 ### 1.3 不是什么
 
-- ❌ **不是完整的文件系统或对象存储** — 不管理数据生命周期，对象存储是数据的唯一真相来源
-- ❌ **不修改对象存储原始数据** — 对象在对象存储中的格式、路径、内容不变（区别于 JuiceFS 的 Chunk/Slice/Block 拆分）
+- ❌ **不是完整的文件系统或对象存储** — 不管理数据生命周期，OSS 是数据的唯一真相来源
+- ❌ **不修改 OSS 原始数据** — 对象在 OSS 中的格式、路径、内容不变（区别于 JuiceFS 的 Chunk/Slice/Block 拆分）
 - ❌ **不是分布式缓存系统** — 数据缓存各节点独立，不做跨节点数据共享（元数据可跨节点共享）
-- ❌ **不支持随机写 / 追加写** — 仅支持"一次写多次读"语义（对象存储语义约束 + 业务约束）
+- ❌ **不支持随机写 / 追加写** — 仅支持"一次写多次读"语义（OSS 语义约束 + 业务约束）
 - ❌ **不替代编排层** — Fuel 是数据面，编排层（Fluid EstoreRuntime 等）是控制面，两者解耦
 
 ### 1.4 核心约束（来自业务需求）
 
 | 约束 | 来源 | 不可变原因 |
 |------|------|-----------|
-| 对象存储原始数据不变 | 业务要求 + 合规 | 对象存储是长期持久化层，不能被缓存层污染 |
+| OSS 原始数据不变 | 业务要求 + 合规 | 对象存储是长期持久化层，不能被缓存层污染 |
 | 一次写多次读 | 业务访问模式 | 训练数据写入后不修改，简化写路径 |
 | POSIX 兼容 | 训练框架要求 | 应用无需改造代码 |
 | 本地 + K8s 双模部署 | 部署演进需求 | 先本地验证，再 K8s 规模化 |
@@ -46,46 +46,46 @@
 
 > 不变量是架构设计的硬约束，任何模块的设计和实现都必须遵守。违反不变量意味着架构方向错误。
 
-### INV-1: 对象存储是数据真相来源
+### INV-1: OSS 是数据真相来源
 
-**表述**: 对象存储对象的元数据（size / etag / mtime）和内容是数据的唯一权威来源。Fuel 的所有缓存层（本地内存缓存、元数据引擎、NVMe 数据缓存）都是对象存储的加速层，可以丢失、可以重建，但不可以被当作数据的权威来源。
+**表述**: OSS 对象的元数据（size / etag / mtime）和内容是数据的唯一权威来源。Fuel 的所有缓存层（本地内存缓存、元数据引擎、NVMe 数据缓存）都是 OSS 的加速层，可以丢失、可以重建，但不可以被当作数据的权威来源。
 
 **设计含义**:
-- 元数据引擎（Redis/MySQL）丢失 → 降级为直查对象存储，功能不受影响，仅性能下降
-- NVMe 缓存丢失 → 从对象存储重新拉取，无数据丢失
-- 任何缓存层的数据都可以通过 `清空 + 从对象存储重新填充` 完整恢复
+- 元数据引擎（Redis/MySQL）丢失 → 降级为直查 OSS，功能不受影响，仅性能下降
+- NVMe 缓存丢失 → 从 OSS 重新拉取，无数据丢失
+- 任何缓存层的数据都可以通过 `清空 + 从 OSS 重新填充` 完整恢复
 - 不存在"元数据引擎丢失 = 数据不可读"的场景（区别于 JuiceFS）
 
-### INV-2: 缓存是对象存储对象的字节镜像
+### INV-2: 缓存是 OSS 对象的字节镜像
 
-**表述**: NVMe 上的缓存文件路径与对象存储对象路径一一对应，内容是对象存储对象的完整字节副本。不做格式转换、分块、压缩、去重。
+**表述**: NVMe 上的缓存文件路径与 OSS 对象路径一一对应，内容是 OSS 对象的完整字节副本。不做格式转换、分块、压缩、去重。
 
 **设计含义**:
-- 缓存路径: `/nvme/cache/{bucket}/{key}` ←→ 对象存储: `oss://{bucket}/{key}`
+- 缓存路径: `/nvme/cache/{bucket}/{key}` ←→ OSS: `oss://{bucket}/{key}`
 - 缓存文件可被外部工具直接读取（`cat` / `md5sum` / `cp`）
 - 缓存可被清空（`rm -rf /nvme/cache/*`），下次访问自动重建
 - 缓存可被离线预热（直接 `cp` 或并行 GET 到缓存目录）
-- 缓存校验基于对象存储 ETag，不做自定义哈希
+- 缓存校验基于 OSS ETag，不做自定义哈希
 
-### INV-3: 写路径不改变对象存储对象格式
+### INV-3: 写路径不改变 OSS 对象格式
 
-**表述**: 写路径通过对象存储 PutObject 整文件上传，不使用 Multipart 分块拼接后产生不同 ETag 的方式（除非业务明确需要大文件 Multipart）。上传后的对象在对象存储中与直接通过对象存储 SDK/控制台上传的对象完全一致。
+**表述**: 写路径通过 OSS PutObject 整文件上传，不使用 Multipart 分块拼接后产生不同 ETag 的方式（除非业务明确需要大文件 Multipart）。上传后的对象在 OSS 中与直接通过 OSS SDK/控制台上传的对象完全一致。
 
 **设计含义**:
-- 写路径: 本地临时文件 → `PutObject` → 对象存储原始对象
-- 上传后的对象存储对象可被其他工具（OSS SDK / ossutil / 控制台）直接访问
+- 写路径: 本地临时文件 → `PutObject` → OSS 原始对象
+- 上传后的 OSS 对象可被其他工具（OSS SDK / ossutil / 控制台）直接访问
 - 不引入只有 Fuel 能解读的数据格式
 
 ### INV-4: 元数据引擎是可选的加速层
 
-**表述**: 元数据引擎（Redis / MySQL / 直查对象存储）是元数据查询的加速层，不是必需组件。三种模式通过统一接口抽象，运行时可切换，切换不改变功能，仅改变性能特征。
+**表述**: 元数据引擎（Redis / MySQL / 直查 OSS）是元数据查询的加速层，不是必需组件。三种模式通过统一接口抽象，运行时可切换，切换不改变功能，仅改变性能特征。
 
 **设计含义**:
-- 模式 A（直查对象存储）: 零外部依赖，功能完整，性能取决于对象存储延迟
+- 模式 A（直查 OSS）: 零外部依赖，功能完整，性能取决于 OSS 延迟
 - 模式 B（Redis）: 跨节点元数据共享，高性能，需部署 Redis
 - 模式 C（MySQL）: 元数据持久化，冷启动快，需部署 MySQL
 - 模式切换通过配置修改，不改代码
-- 元数据引擎不可用时，自动降级为直查对象存储
+- 元数据引擎不可用时，自动降级为直查 OSS
 
 ### INV-5: FUSE 进程与编排层解耦
 
@@ -94,7 +94,7 @@
 **设计含义**:
 - 本地裸机: `fuel mount` 直接运行，systemd 管理
 - K8s: FUSE 进程在 Pod 中运行，CSI/Webhook 负责挂载和注入
-- 数据路径: 应用 → FUSE → 缓存 → 对象存储，编排层不在此路径上
+- 数据路径: 应用 → FUSE → 缓存 → OSS，编排层不在此路径上
 - 编排层升级 / 重启不影响已挂载的 FUSE 数据路径
 
 ### INV-6: 单节点数据缓存，不做跨节点数据共享
@@ -109,7 +109,7 @@
 
 ### INV-7: 模块边界通过接口隔离
 
-**表述**: 核心模块（FUSE 层、缓存层、元数据层、对象存储客户端、部署层、监控层）之间通过 Go interface 隔离，不直接依赖具体实现。模块可独立测试、替换、演进。
+**表述**: 核心模块（FUSE 层、缓存层、元数据层、OSS 客户端、部署层、监控层）之间通过 Go interface 隔离，不直接依赖具体实现。模块可独立测试、替换、演进。
 
 **设计含义**:
 - FUSE 层依赖 `MetadataEngine` 接口，不依赖 `RedisEngine` 具体类型
@@ -125,7 +125,7 @@
 
 ### GOAL-1: POSIX 兼容性
 
-**目标**: 训练框架通过标准 POSIX 接口透明访问对象存储数据，无需修改代码。
+**目标**: 训练框架通过标准 POSIX 接口透明访问 OSS 数据，无需修改代码。
 
 **验收标准**:
 - 实现 `stat` / `lookup` / `open` / `read` / `readdir` / `mkdir` / `rmdir` / `create` / `write` / `flush` / `unlink` / `rename` / `fsync`
@@ -144,11 +144,11 @@
 
 ### GOAL-3: 缓存未命中回源性能
 
-**目标**: 缓存未命中时充分利用对象存储内网带宽，回源延迟可控。
+**目标**: 缓存未命中时充分利用 OSS 内网带宽，回源延迟可控。
 
 **验收标准**:
-- 缓存未命中读延迟 P50 < 50ms（对象存储内网 GET Range）
-- 大文件并发拉取吞吐 ≥ 对象存储内网带宽的 80%
+- 缓存未命中读延迟 P50 < 50ms（OSS 内网 GET Range）
+- 大文件并发拉取吞吐 ≥ OSS 内网带宽的 80%
 - 元数据回源（HEAD）延迟 P50 < 30ms
 
 ### GOAL-4: 缓存命中率
@@ -172,22 +172,22 @@
 
 ### GOAL-6: 可观测性
 
-**目标**: 缓存命中率、对象存储请求量、FUSE 延迟、元数据引擎状态等关键指标可监控可告警。
+**目标**: 缓存命中率、OSS 请求量、FUSE 延迟、元数据引擎状态等关键指标可监控可告警。
 
 **验收标准**:
 - Prometheus `/metrics` 端点暴露全部指标
 - `/health` 端点支持 K8s livenessProbe
-- 关键告警: 缓存命中率低 / 对象存储错误率高 / 元数据引擎不可达 / FUSE 延迟高
+- 关键告警: 缓存命中率低 / OSS 错误率高 / 元数据引擎不可达 / FUSE 延迟高
 
 ### GOAL-7: 故障降级
 
 **目标**: 任何缓存层故障不影响数据可读性（仅影响性能）。
 
 **验收标准**:
-- NVMe 磁盘故障 → 从对象存储重新拉取
-- 元数据引擎不可达 → 降级为直查对象存储
+- NVMe 磁盘故障 → 从 OSS 重新拉取
+- 元数据引擎不可达 → 降级为直查 OSS
 - FUSE 进程崩溃 → systemd/K8s 自动重启，缓存索引重建
-- 对象存储不可达 → 已缓存数据正常读，未缓存返回 EIO
+- OSS 不可达 → 已缓存数据正常读，未缓存返回 EIO
 
 ### GOAL-8: 可维护性
 
@@ -279,7 +279,7 @@ fuel/
 │   │   └── index.go       # 缓存索引持久化 (BoltDB)
 │   ├── metadata/          # 元数据引擎层 (L2)
 │   │   ├── engine.go      # MetadataEngine 接口
-│   │   ├── oss.go         # 模式 A: 直查对象存储
+│   │   ├── oss.go         # 模式 A: 直查 OSS
 │   │   ├── redis.go       # 模式 B: Redis
 │   │   ├── mysql.go       # 模式 C: MySQL
 │   │   └── types.go       # MetaEntry 数据结构
@@ -335,7 +335,7 @@ type MetadataEngine interface {
     Close() error
 }
 
-// DataCache 数据缓存接口 (INV-2: 缓存是对象存储对象的字节镜像)
+// DataCache 数据缓存接口 (INV-2: 缓存是 OSS 对象的字节镜像)
 // 缓存单位是整文件，返回本地文件路径，FUSE 层通过 pread 直读
 type DataCache interface {
     Get(key, etag string) (localPath string, hit bool, err error)
@@ -358,9 +358,9 @@ read(path, offset, size)
   ├── 1. 元数据获取
   │     L1 内存缓存 (TTL 30s) → hit: 用缓存 etag/size
   │     L1 miss → L2 元数据引擎
-  │       模式 A: 对象存储 HEAD → 返回 + 写回 L1
+  │       模式 A: OSS HEAD → 返回 + 写回 L1
   │       模式 B: Redis GET → hit: 返回 + 写回 L1
-  │       模式 B: Redis miss → 对象存储 HEAD → 写回 Redis + L1
+  │       模式 B: Redis miss → OSS HEAD → 写回 Redis + L1
   │       模式 C: MySQL SELECT → 同 B
   │
   ├── 2. 数据缓存查找
@@ -382,7 +382,7 @@ read(path, offset, size)
 write(path, data)
   │
   ├── 1. 写本地临时文件
-  ├── 2. PutObject → 对象存储 (INV-3: 不改变对象存储对象格式)
+  ├── 2. PutObject → OSS (INV-3: 不改变 OSS 对象格式)
   ├── 3. 失效缓存
   │     L1: statCache.Delete(path) + dirCache.Delete(parentDir)
   │     L2: MetadataEngine.Invalidate(path)
@@ -398,11 +398,11 @@ stat(path)
   │
   ├── L1 内存缓存 (TTL 30s) → hit → 返回
   ├── L1 miss → L2 元数据引擎
-  │     模式 A: 对象存储 HEAD
+  │     模式 A: OSS HEAD
   │     模式 B: Redis GET
   │     模式 C: MySQL SELECT
   ├── L2 hit → 写回 L1 → 返回
-  └── L2 miss → 对象存储 HEAD (真相来源)
+  └── L2 miss → OSS HEAD (真相来源)
         存在 → 构造 MetaEntry → 写回 L2 + L1 → 返回
         不存在 → 写入负缓存 (60s) → 返回 ENOENT
 ```
@@ -417,11 +417,11 @@ stat(path)
 |------|------|---------|
 | 语言 | Go 1.21+ | 开发效率 + FUSE 库生态 + goroutine 并发模型 |
 | FUSE 库 | `github.com/hanwen/go-fuse/v2` | JuiceFS 生产验证，Go 生态最成熟的 FUSE 库 |
-| OSS SDK | `github.com/aliyun/aliyun-oss-go-sdk/oss` | 阿里云官方 SDK，原生对象存储 API |
+| OSS SDK | `github.com/aliyun/aliyun-oss-go-sdk/oss` | 阿里云官方 SDK，原生 OSS API |
 | Redis 客户端 | `github.com/redis/go-redis/v9` | 元数据引擎模式 B |
 | MySQL 驱动 | `github.com/go-sql-driver/mysql` | 元数据引擎模式 C |
 | 监控 | `github.com/prometheus/client_golang` | 与现有监控体系一致 |
-| 配置 | `gopkg.in/yaml.v3` | YAML + 环境变量 + 命令行（未引入 viper，符合 §11.3 不过度设计） |
+| 配置 | `github.com/spf13/viper` | YAML + 环境变量 + 命令行 |
 | 日志 | `go.uber.org/zap` | 高性能结构化日志 |
 | 缓存索引 | `go.etcd.io/bbolt` (可选) | LRU 索引持久化，嵌入式 KV |
 
@@ -453,7 +453,7 @@ stat(path)
 
 ```
 FUSE 挂载点:   /fuel/{bucket}
-对象存储对象路径:  oss://{bucket}/{key}
+OSS 对象路径:  oss://{bucket}/{key}
 FUSE 文件路径: /fuel/{bucket}/{key}
 本地缓存路径:  {cache_dir}/{bucket}/{key}
 ```
@@ -468,9 +468,9 @@ FUSE:         /fuel/eabot-train-prod/training/2024-q1/frame_000001.jpg
 
 ### 6.3 目录语义
 
-对象存储没有真正的目录，目录由对象 key 的前缀隐式构成。Fuel 的处理：
+OSS 没有真正的目录，目录由对象 key 的前缀隐式构成。Fuel 的处理：
 
-| 操作 | 对象存储行为 | 说明 |
+| 操作 | OSS 行为 | 说明 |
 |------|---------|------|
 | `readdir(dir)` | `ListObjects(prefix=dir/)` | 列出前缀下的直接子项 |
 | `mkdir(dir)` | 创建 0 字节对象 `dir/` | 显式目录标记（兼容 OSS-HDFS） |
@@ -497,17 +497,17 @@ FUSE:         /fuel/eabot-train-prod/training/2024-q1/frame_000001.jpg
   → 主动失效 L1 (内存)
   → 主动失效 L2 (Redis/MySQL)
   → 主动删除数据缓存 (NVMe)
-  → 后续读必然从对象存储获取最新 ETag → 重新拉取
+  → 后续读必然从 OSS 获取最新 ETag → 重新拉取
 ```
 
 ### 7.3 缓存校验
 
-| 校验时机 | 机制 | 对象存储请求 |
+| 校验时机 | 机制 | OSS 请求 |
 |---------|------|---------|
 | `open()` | HEAD 获取 ETag，与本地缓存比对 | 1 次 HEAD（L1/L2 miss 时） |
 | `read()` | 不重复校验（open 时已校验） | 0 |
 | 文件不变期间 | L1 TTL 内不重复 HEAD | 0 |
-| 元数据引擎缓存 | L2 miss → 对象存储 HEAD 回填 | 1 次 HEAD（首次访问） |
+| 元数据引擎缓存 | L2 miss → OSS HEAD 回填 | 1 次 HEAD（首次访问） |
 
 ### 7.4 负缓存
 
@@ -575,7 +575,7 @@ monitor:
 
 ### 8.3 敏感信息
 
-对象存储 AK/SK 和 Redis/MySQL 密码**不写入配置文件**，通过环境变量注入：
+OSS AK/SK 和 Redis/MySQL 密码**不写入配置文件**，通过环境变量注入：
 
 ```
 OSS_ACCESS_KEY_ID
@@ -602,8 +602,8 @@ fuel_meta_hit_total{layer="l1"}                # 元数据 L1 命中
 fuel_meta_hit_total{layer="l2"}                # 元数据 L2 命中
 fuel_meta_miss_total                            # 元数据全部 miss
 fuel_neg_cache_hit_total                        # 负缓存命中
-fuel_oss_requests_total{operation="head"}       # 对象存储 HEAD 次数
-fuel_oss_request_duration_seconds{operation="get"}  # 对象存储 GET 延迟
+fuel_oss_requests_total{operation="head"}       # OSS HEAD 次数
+fuel_oss_request_duration_seconds{operation="get"}  # OSS GET 延迟
 fuel_fuse_read_duration_seconds                 # 读延迟分布
 fuel_fuse_operations_total{op="stat"}           # FUSE 操作计数
 fuel_prefetch_total                             # 预读次数
@@ -636,73 +636,13 @@ systemd 管理进程生命周期，`Restart=always`。
 
 ### 10.2 K8s 三种模式
 
-| 模式 | 适用场景 | 核心组件 | 部署分期 |
-|------|---------|---------|---------|
-| DaemonSet | GPU 训练节点（低 Pod 密度），与 Alluxio 对齐 | FUSE Pod (DaemonSet) + 应用 Pod (hostPath) | **第一期**（Phase 4，MVP 主推） |
-| CSI Driver | 标准 K8s PVC 语义，多团队/多应用共享 | CSI NodePlugin + FUSE DaemonSet + StorageClass/PVC | **第二期**（Phase 5） |
-| Sidecar | 多租户 / Pod 级隔离 | 应用 Pod + FUSE Sidecar 容器 | **第二期**（Phase 5） |
+| 模式 | 适用场景 | 核心组件 |
+|------|---------|---------|
+| DaemonSet | GPU 训练节点（低 Pod 密度），与 Alluxio 对齐 | FUSE Pod (DaemonSet) + 应用 Pod (hostPath) |
+| CSI Driver | 标准 K8s PVC 语义 | CSI NodePlugin + FUSE DaemonSet + StorageClass/PVC |
+| Sidecar | 多租户 / Pod 级隔离 | 应用 Pod + FUSE Sidecar 容器 |
 
-> 应用 Pod 自身均**不运行 FUSE 进程、不需要 privileged**，FUSE 由独立组件（DaemonSet / CSI NodePlugin / Sidecar 容器）提供，应用以普通 POSIX 路径访问。
-
-### 10.3 各模式下应用 Pod 的接入方式
-
-**第一期 — DaemonSet（hostPath）**：FUSE 以 DaemonSet 在节点挂载 `/fuel/{bucket}`，应用 Pod 通过 hostPath 映射进容器，必须设 `mountPropagation: HostToContainer`（否则容器看到的是宿主机挂载点下的空目录）：
-
-```yaml
-spec:
-  containers:
-  - name: train
-    volumeMounts:
-    - name: fuel-data
-      mountPath: /data
-      mountPropagation: HostToContainer
-  volumes:
-  - name: fuel-data
-    hostPath:
-      path: /fuel/eabot-train-prod
-      type: Directory
-```
-
-**第二期 — CSI（PVC）**：应用 Pod 声明标准 PVC，CSI NodePlugin 在 `NodePublishVolume` 时把节点上 FUSE 挂载点 bind-mount 到 Pod targetPath。应用完全不感知 FUSE：
-
-```yaml
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: train-data
-spec:
-  storageClassName: fuel-csi
-  accessModes: [ReadOnlyMany]
----
-spec:
-  containers:
-  - name: train
-    volumeMounts:
-    - { name: data, mountPath: /data }
-  volumes:
-  - name: data
-    persistentVolumeClaim:
-      claimName: train-data
-```
-
-**第二期 — Sidecar（emptyDir 共享）**：FUSE 容器与应用容器同 Pod，通过 emptyDir 共享挂载点，仅 FUSE 容器需 privileged：
-
-```yaml
-spec:
-  containers:
-  - name: fuse
-    securityContext: { privileged: true }
-    volumeMounts:
-    - { name: shared, mountPath: /fuel, mountPropagation: Bidirectional }
-  - name: train
-    volumeMounts:
-    - { name: shared, mountPath: /data, mountPropagation: HostToContainer }
-  volumes:
-  - name: shared
-    emptyDir: {}
-```
-
-### 10.4 部署不变量
+### 10.3 部署不变量
 
 - FUSE 进程需要 `/dev/fuse` 设备访问权限
 - FUSE 进程需要 `privileged` 或 `CAP_SYS_ADMIN` 安全上下文
@@ -718,7 +658,7 @@ spec:
 每个阶段必须**独立可验证**，前一阶段是后一阶段的前置条件：
 
 ```
-Phase 1: 只读 MVP (模式 A: 直查对象存储)
+Phase 1: 只读 MVP (模式 A: 直查 OSS)
   → 先证明"能读" + "缓存命中"
 
 Phase 2: 性能优化
@@ -727,11 +667,11 @@ Phase 2: 性能优化
 Phase 3: 元数据引擎 (模式 B/C) + 写路径
   → 然后扩展到"跨节点共享" + "能写"
 
-Phase 4: 生产化 (第一期部署: K8s DaemonSet + 监控 + 故障恢复)
+Phase 4: 生产化 (K8s 部署 + 监控 + 故障恢复)
   → 最后实现"可运维"
 
-Phase 5: K8s 深度集成 (第二期部署: CSI Driver + Sidecar + Webhook + 编排层)
-  → 远期目标: 应用 Pod 通过标准 PVC 透明挂载，或 Sidecar 提供 Pod 级隔离
+Phase 5: K8s 深度集成 (CSI + Webhook + 编排层)
+  → 远期目标
 ```
 
 ### 11.2 Phase 1 最小验证标准
@@ -779,7 +719,7 @@ Phase 1 完成后必须满足：
 
 ### 12.3 错误处理
 
-- 外部错误（对象存储 / Redis / MySQL）必须包装上下文: `fmt.Errorf("head object %s: %w", key, err)`
+- 外部错误（OSS / Redis / MySQL）必须包装上下文: `fmt.Errorf("head object %s: %w", key, err)`
 - 用户可见错误返回 POSIX errno: `syscall.ENOENT`, `syscall.EIO`
 - 内部错误带结构化日志
 
@@ -788,7 +728,7 @@ Phase 1 完成后必须满足：
 | 测试类型 | 覆盖范围 | 工具 |
 |---------|---------|------|
 | 单元测试 | 每个模块的接口实现 | Go testing + mock |
-| 集成测试 | FUSE 挂载 + 真实对象存储读取 | Go testing + build tag `integration` |
+| 集成测试 | FUSE 挂载 + 真实 OSS 读取 | Go testing + build tag `integration` |
 | Benchmark | 读延迟 / 吞吐 / 缓存命中 | Go benchmark + pprof |
 
 ---
@@ -823,7 +763,7 @@ type DirEntry struct {
     Meta  *MetaEntry `json:"meta"`     // 来自 ListObjects 的内联元数据
 }
 
-// ObjectMeta 对象存储对象元数据 (来自 HEAD)
+// ObjectMeta OSS 对象元数据 (来自 HEAD)
 type ObjectMeta struct {
     Key          string
     Size         int64
@@ -832,7 +772,7 @@ type ObjectMeta struct {
     ContentType  string
 }
 
-// ObjectEntry 对象存储对象列表项 (来自 List)
+// ObjectEntry OSS 对象列表项 (来自 List)
 type ObjectEntry struct {
     Key  string
     Size int64
