@@ -130,7 +130,7 @@ Phase 6: 多后端扩展 (按需)                       按需
 - `HealthCheck` 通过 bucket 根 `List(maxKeys=1)` 探测可达性。
 - 错误传播：Head/List 的非 ENOENT 错误（EACCES/EIO）原样包装上传，仅 ENOENT 触发目录推断链。
 
-#### 2.2 数据缓存 (NVMe LRU)
+#### 2.2 数据缓存 (NVMe LRU) ✅
 
 ```
 任务: 实现 NVMe 数据缓存
@@ -147,6 +147,17 @@ Phase 6: 多后端扩展 (按需)                       按需
   LRU 淘汰: 超过高水位 → 删除最久未访问 → 低于低水位
   go test ./internal/cache/... 通过
 ```
+
+**实际交付**（2026-08-15）: `index.go`（`cacheIndex` = map + `container/list` LRU 双向链表，Front 最近访问）、`eviction.go`（高低水位淘汰）、`data.go`（`nvmeCache` 实现 `api.DataCache`）、`data_test.go` + `eviction_test.go`。测试覆盖 88.9%，`go test -race` 干净。
+
+**实现要点**:
+- 构造函数 `NewNVMeCache(dir, bucket, capacity, highWatermark, lowWatermark, maxFileSize)`，bucket 注入以构成路径 `{dir}/{bucket}/{key}`（INV-2）。
+- **写入**：`os.MkdirAll` 父目录 → 同目录 `CreateTemp` → `io.Copy` 流式 → `fsync` → `os.Rename`（原子，同文件系统）。临时文件任何失败都清理。
+- **ETag 校验**：`Get` 时索引 etag 不匹配 → 删条目+文件 → miss；文件被外部删除 → 清索引 → miss。
+- **LRU 淘汰**：写入前 `used+incoming > 高水位` → `evictFor` 淘汰到 `used+incoming <= 低水位`；写遇 `ENOSPC` 再淘汰重试一次，仍失败返回错误（上层降级不缓存，IMPL_DESIGN §9.2）。
+- **并发**：hits/misses 用 `atomic.Int64`；索引用 `sync.Mutex`（淘汰需全局一致视图，IMPL_DESIGN §7.2）。
+- **防御**：`sanitizeKey` 拒绝空/`..`/绝对路径 key；`maxFileSize` 超限不缓存。
+- 同 key 重复 Put 覆盖，used 不重复累计（先减旧 size）。
 
 #### 2.3 元数据 L1 内存缓存
 

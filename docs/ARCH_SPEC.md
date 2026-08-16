@@ -523,7 +523,7 @@ OSS 没有真正的目录，目录由对象 key 的前缀隐式构成。Fuel 的
 # fuel-config.yaml
 storage:
   type: oss                            # oss | s3 | minio (INV-8: 后端可插拔)
-  bucket: eabot-train-prod
+  bucket: train-dataset
   oss:
     endpoint: oss-cn-wulanchabu-internal.aliyuncs.com
   # AK/SK 通过环境变量 OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET 注入
@@ -555,7 +555,7 @@ prefetch:
     max: 16777216                # 16MB
 
 fuse:
-  mountPoint: /fuel/eabot-train-prod
+  mountPoint: /fuel/train-dataset
   maxRead: 1048576               # 1MB
   options:
     - allow_other

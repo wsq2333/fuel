@@ -776,8 +776,10 @@ fuel/
 │   │   └── mount.go           # 挂载参数 + 内核选项
 │   ├── cache/
 │   │   ├── data.go            # DataCache 实现 (NVMe 整文件缓存)
-│   │   ├── meta.go            # MetaCache 实现 (L1 内存 TTL 缓存)
+│   │   ├── data_test.go       # DataCache 单元测试
+│   │   ├── meta.go            # MetaCache 实现 (L1 内存 TTL 缓存) [Week 2.3]
 │   │   ├── eviction.go        # LRU 淘汰器 (高低水位)
+│   │   ├── eviction_test.go   # LRU 淘汰单元测试
 │   │   └── index.go           # 缓存索引 (内存 map, 可选 BoltDB 持久化)
 │   ├── metadata/
 │   │   ├── direct.go          # 模式 A: 直查 ObjectStore
