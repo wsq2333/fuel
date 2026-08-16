@@ -636,13 +636,73 @@ systemd 管理进程生命周期，`Restart=always`。
 
 ### 10.2 K8s 三种模式
 
-| 模式 | 适用场景 | 核心组件 |
-|------|---------|---------|
-| DaemonSet | GPU 训练节点（低 Pod 密度），与 Alluxio 对齐 | FUSE Pod (DaemonSet) + 应用 Pod (hostPath) |
-| CSI Driver | 标准 K8s PVC 语义 | CSI NodePlugin + FUSE DaemonSet + StorageClass/PVC |
-| Sidecar | 多租户 / Pod 级隔离 | 应用 Pod + FUSE Sidecar 容器 |
+| 模式 | 适用场景 | 核心组件 | 部署分期 |
+|------|---------|---------|---------|
+| DaemonSet | GPU 训练节点（低 Pod 密度），与 Alluxio 对齐 | FUSE Pod (DaemonSet) + 应用 Pod (hostPath) | **第一期**（Phase 4，MVP 主推） |
+| CSI Driver | 标准 K8s PVC 语义，多团队/多应用共享 | CSI NodePlugin + FUSE DaemonSet + StorageClass/PVC | **第二期**（Phase 5） |
+| Sidecar | 多租户 / Pod 级隔离 | 应用 Pod + FUSE Sidecar 容器 | **第二期**（Phase 5） |
 
-### 10.3 部署不变量
+> 应用 Pod 自身均**不运行 FUSE 进程、不需要 privileged**，FUSE 由独立组件（DaemonSet / CSI NodePlugin / Sidecar 容器）提供，应用以普通 POSIX 路径访问。
+
+### 10.3 各模式下应用 Pod 的接入方式
+
+**第一期 — DaemonSet（hostPath）**：FUSE 以 DaemonSet 在节点挂载 `/fuel/{bucket}`，应用 Pod 通过 hostPath 映射进容器，必须设 `mountPropagation: HostToContainer`（否则容器看到的是宿主机挂载点下的空目录）：
+
+```yaml
+spec:
+  containers:
+  - name: train
+    volumeMounts:
+    - name: fuel-data
+      mountPath: /data
+      mountPropagation: HostToContainer
+  volumes:
+  - name: fuel-data
+    hostPath:
+      path: /fuel/eabot-train-prod
+      type: Directory
+```
+
+**第二期 — CSI（PVC）**：应用 Pod 声明标准 PVC，CSI NodePlugin 在 `NodePublishVolume` 时把节点上 FUSE 挂载点 bind-mount 到 Pod targetPath。应用完全不感知 FUSE：
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: train-data
+spec:
+  storageClassName: fuel-csi
+  accessModes: [ReadOnlyMany]
+---
+spec:
+  containers:
+  - name: train
+    volumeMounts:
+    - { name: data, mountPath: /data }
+  volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: train-data
+```
+
+**第二期 — Sidecar（emptyDir 共享）**：FUSE 容器与应用容器同 Pod，通过 emptyDir 共享挂载点，仅 FUSE 容器需 privileged：
+
+```yaml
+spec:
+  containers:
+  - name: fuse
+    securityContext: { privileged: true }
+    volumeMounts:
+    - { name: shared, mountPath: /fuel, mountPropagation: Bidirectional }
+  - name: train
+    volumeMounts:
+    - { name: shared, mountPath: /data, mountPropagation: HostToContainer }
+  volumes:
+  - name: shared
+    emptyDir: {}
+```
+
+### 10.4 部署不变量
 
 - FUSE 进程需要 `/dev/fuse` 设备访问权限
 - FUSE 进程需要 `privileged` 或 `CAP_SYS_ADMIN` 安全上下文
@@ -667,11 +727,11 @@ Phase 2: 性能优化
 Phase 3: 元数据引擎 (模式 B/C) + 写路径
   → 然后扩展到"跨节点共享" + "能写"
 
-Phase 4: 生产化 (K8s 部署 + 监控 + 故障恢复)
+Phase 4: 生产化 (第一期部署: K8s DaemonSet + 监控 + 故障恢复)
   → 最后实现"可运维"
 
-Phase 5: K8s 深度集成 (CSI + Webhook + 编排层)
-  → 远期目标
+Phase 5: K8s 深度集成 (第二期部署: CSI Driver + Sidecar + Webhook + 编排层)
+  → 远期目标: 应用 Pod 通过标准 PVC 透明挂载，或 Sidecar 提供 Pod 级隔离
 ```
 
 ### 11.2 Phase 1 最小验证标准

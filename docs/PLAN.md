@@ -12,12 +12,17 @@
 Phase 1: 只读 MVP (模式 A: 直查对象存储)       3 周
 Phase 2: 性能优化 + Benchmark                   2 周
 Phase 3: 元数据引擎 (模式 B/C) + 写路径         3 周
-Phase 4: 生产化 (K8s DaemonSet + 监控)          2 周
-Phase 5: CSI Driver + PVC + K8s 深度集成        3 周
+Phase 4: 生产化 (第一期部署: K8s DaemonSet + 监控)   2 周
+Phase 5: 第二期部署 (CSI Driver + Sidecar + PVC)     3 周
 Phase 6: 多后端扩展 (按需)                       按需
 ```
 
-总工期：**13 周（约 3 个月）**，其中 Phase 1-4 为 MVP 到生产可用的核心路径（10 周），Phase 5 为 K8s 标准化部署（3 周）。
+总工期：**13 周（约 3 个月）**，其中 Phase 1-4 为 MVP 到生产可用的核心路径（10 周，第一期部署用 DaemonSet），Phase 5 为第二期部署（K8s 标准化：CSI + Sidecar，3 周）。
+
+### 部署分期说明
+
+- **第一期部署（Phase 4）**：DaemonSet + hostPath。面向 GPU 训练节点，应用 Pod 通过 hostPath + `mountPropagation: HostToContainer` 访问节点级 FUSE 挂载点 `/fuel/{bucket}`。
+- **第二期部署（Phase 5）**：CSI Driver（标准 PVC 语义，应用 Pod 不感知 FUSE）+ Sidecar（多租户 Pod 级隔离）。三种模式下应用 Pod 均不运行 FUSE、不需要 privileged，详见 ARCH_SPEC §10.3。
 
 ### 关键里程碑
 
@@ -496,7 +501,7 @@ Phase 6: 多后端扩展 (按需)                       按需
 
 ---
 
-## 5. Phase 4: 生产化 — K8s DaemonSet + 监控（2 周）
+## 5. Phase 4: 生产化 — 第一期部署 (K8s DaemonSet + 监控)（2 周）
 
 > 目标：systemd + K8s DaemonSet 部署 + Prometheus 监控 + 故障恢复。7 天无故障运行。
 
@@ -629,9 +634,9 @@ Phase 6: 多后端扩展 (按需)                       按需
 
 ---
 
-## 6. Phase 5: CSI Driver + PVC + K8s 深度集成（3 周）
+## 6. Phase 5: 第二期部署 — CSI Driver + Sidecar + PVC（3 周）
 
-> 目标：标准 K8s CSI 语义，应用 Pod 通过 PVC 透明挂载。
+> 目标：标准 K8s CSI 语义，应用 Pod 通过 PVC 透明挂载；Sidecar 提供多租户 Pod 级隔离。应用 Pod 均不运行 FUSE、不需要 privileged（接入方式见 ARCH_SPEC §10.3）。
 
 ### Week 11: CSI Driver 核心实现
 
@@ -855,7 +860,7 @@ Phase 5 交付 (Week 11-13):
 | §8 配置规范 | Phase 1 | 配置结构体按此定义 |
 | §9 监控规范 | Phase 4 | Prometheus 指标按此实现 |
 | §10.1 本地部署 | Phase 4 | systemd 部署 |
-| §10.4 CSI Driver | Phase 5 | CSI Driver 实现 |
+| §10.2-10.3 K8s 模式与接入方式 | Phase 4-5 | DaemonSet (第一期) / CSI + Sidecar (第二期) |
 | §11.2 Phase 1 验证标准 | Phase 1 | 最小验证标准 |
 | §11.3 不做过度设计 | 全部 Phase | 每个 Phase 遵守 |
 | GOAL-1 POSIX | Phase 1-3 | 逐步实现操作 |
