@@ -65,7 +65,7 @@
 - 缓存文件可被外部工具直接读取（`cat` / `md5sum` / `cp`）
 - 缓存可被清空（`rm -rf /nvme/cache/*`），下次访问自动重建
 - 缓存可被离线预热（直接 `cp` 或并行 GET 到缓存目录）
-- 缓存校验基于 OSS ETag，不做自定义哈希
+- 缓存校验基于 OSS ETag（身份校验）；内容完整性巡检复用 ETag 即整文件 MD5 的语义，不引入自定义哈希（见 §7.3）
 
 ### INV-3: 写路径不改变 OSS 对象格式
 
@@ -502,12 +502,26 @@ OSS 没有真正的目录，目录由对象 key 的前缀隐式构成。Fuel 的
 
 ### 7.3 缓存校验
 
+缓存一致性分两层：**身份校验**（OSS 对象变了没）与**内容校验**（缓存文件本身坏了没）。
+
+**身份校验（ETag，读路径，在线）** — 检测"OSS 对象被外部修改"：
+
 | 校验时机 | 机制 | OSS 请求 |
 |---------|------|---------|
 | `open()` | HEAD 获取 ETag，与本地缓存比对 | 1 次 HEAD（L1/L2 miss 时） |
 | `read()` | 不重复校验（open 时已校验） | 0 |
 | 文件不变期间 | L1 TTL 内不重复 HEAD | 0 |
 | 元数据引擎缓存 | L2 miss → OSS HEAD 回填 | 1 次 HEAD（首次访问） |
+
+**内容校验（MD5，后台巡检，离线）** — 检测"缓存文件磁盘损坏/bit翻转/外部篡改"（ETag 未变但内容已坏，身份校验发现不了）：
+
+- 原理：OSS 整文件 PutObject 的 ETag 即内容 MD5（INV-3 保证整文件上传、不用 Multipart），可直接复用为内容哈希，无需额外计算/存储。
+- 机制：`DataCache.Verify()` 后台巡检遍历缓存索引，对每个文件流式算 MD5 与缓存时 ETag 比对；不一致 → 剔除坏文件（删索引 + 删磁盘），后续读自然 miss → 回源重拉。
+- Multipart 上传的对象 ETag 含 `-`（非内容 MD5），巡检跳过不比对。
+- 不打断读路径性能（GOAL-2）：巡检由 **FUSE 层的后台 goroutine 周期性触发**（server 启动时拉起，周期取 `cache.verifyInterval`，0 表示关闭），DataCache 仅提供原子能力 `Verify()`。
+- 接口隔离（INV-7）：`Verify()` 不进 `DataCache` 主接口，而是独立的可选接口 `api.CacheVerifier`。FUSE 层用接口断言 `dataCache.(api.CacheVerifier)` 探测能力，不强迫所有 DataCache 实现提供巡检。
+
+**写入完整性（防半拉取）**：临时文件 + fsync + atomic rename 保证原子入库；进程崩溃残留 `.fuel-*` 半成品，启动时 `cleanOrphanTemps` 清理，不会进入索引。
 
 ### 7.4 负缓存
 
@@ -546,6 +560,7 @@ cache:
   lowWatermark: 0.70
   blockSize: 4194304             # 4MB
   maxFileSize: 1073741824        # 1GB (超过不缓存, MVP)
+  verifyInterval: 0s             # 缓存内容巡检周期 (FUSE 层后台 goroutine), 0=关闭 (§7.3)
 
 prefetch:
   enabled: true

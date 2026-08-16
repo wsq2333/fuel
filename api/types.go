@@ -53,6 +53,14 @@ type CacheStats struct {
 	EvictionCount int64
 }
 
+// VerifyResult 缓存内容完整性巡检结果 (见 CacheVerifier)。
+type VerifyResult struct {
+	Checked   int      // 实际做内容校验的文件数
+	Corrupted []string // 内容损坏被剔除的 key
+	Skipped   int      // 跳过的文件数（ETag 非内容 MD5，如 Multipart 上传）
+	Missing   []string // 索引有但磁盘文件丢失的 key
+}
+
 // InodeFromPath 返回 path 的稳定 inode 号（FNV-1a 64-bit，最低位置 1 避免 inode=0）。
 func InodeFromPath(path string) uint64 {
 	h := fnv.New64a()

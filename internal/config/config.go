@@ -67,6 +67,10 @@ type CacheConfig struct {
 	HighWatermark float64 `yaml:"highWatermark"`
 	LowWatermark  float64 `yaml:"lowWatermark"`
 	MaxFileSize   int64   `yaml:"maxFileSize"`
+
+	// VerifyInterval 缓存内容完整性巡检周期（FUSE 层后台 goroutine 触发 DataCache.Verify）。
+	// 0 表示关闭巡检。默认 0（MVP 不开启，由部署方按需打开）。
+	VerifyInterval time.Duration `yaml:"verifyInterval"`
 }
 
 // PrefetchConfig 预读配置（Phase 2）。

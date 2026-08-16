@@ -116,3 +116,16 @@ func (ix *cacheIndex) stats() (int64, int64, int64) {
 	defer ix.mu.Unlock()
 	return ix.used, int64(len(ix.items)), ix.evicted
 }
+
+// snapshot 返回所有索引条目的副本（用于后台巡检遍历，遍历时无需持锁）。
+func (ix *cacheIndex) snapshot() []*cacheEntry {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	out := make([]*cacheEntry, 0, len(ix.items))
+	for _, el := range ix.items {
+		entry := el.Value.(*cacheEntry)
+		cp := *entry
+		out = append(out, &cp)
+	}
+	return out
+}

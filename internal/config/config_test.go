@@ -192,3 +192,42 @@ func TestLoad_EmptyPathUsesDefaults(t *testing.T) {
 		t.Fatal("expected error for missing bucket with empty path, got nil")
 	}
 }
+
+func TestLoad_VerifyInterval(t *testing.T) {
+	yaml := `
+storage:
+  type: oss
+  bucket: b
+  oss:
+    endpoint: e
+cache:
+  dir: /tmp/cache
+  verifyInterval: 10m
+`
+	path := writeTempConfig(t, yaml)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if cfg.Cache.VerifyInterval != 10*time.Minute {
+		t.Errorf("expected verifyInterval 10m, got %v", cfg.Cache.VerifyInterval)
+	}
+}
+
+func TestLoad_VerifyIntervalDefaultZero(t *testing.T) {
+	yaml := `
+storage:
+  type: oss
+  bucket: b
+  oss:
+    endpoint: e
+`
+	path := writeTempConfig(t, yaml)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if cfg.Cache.VerifyInterval != 0 {
+		t.Errorf("expected default verifyInterval 0 (disabled), got %v", cfg.Cache.VerifyInterval)
+	}
+}

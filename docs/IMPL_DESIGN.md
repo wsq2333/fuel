@@ -574,6 +574,18 @@ func (r *FuelRoot) fetchAndCache(ctx context.Context, key, etag string, size int
 | 跨节点写后读 | 最终一致 | 写节点失效 L2（Redis/MySQL）；读节点 L1 TTL 过期后从 L2 获取最新数据 |
 | 对象存储外部修改 | 最终一致 | L1 TTL 过期后 HEAD 获取新 ETag → ETag 不匹配 → 数据缓存失效 → 重新拉取 |
 | 对象存储外部删除 | 最终一致 | L1 TTL 过期后 HEAD 返回 404 → 写入负缓存 → 返回 ENOENT |
+| 缓存文件磁盘损坏 | 检出即剔除 | `nvmeCache.Verify()` 后台巡检：流式算文件 MD5 与缓存时 ETag 比对（整文件上传 ETag 即内容 MD5），不一致 → 删索引 + 删文件 → 后续读 miss 回源；Multipart ETag（含 `-`）跳过 |
+| 拉取中断/半拉取 | 不入库 | 临时文件 + fsync + atomic rename；崩溃残留 `.fuel-*` 由启动时 `cleanOrphanTemps` 清理 |
+
+### 7.4 缓存内容巡检的触发（FUSE 层后台 goroutine）
+
+`nvmeCache.Verify()` 是 DataCache 的原子能力，**触发点放在 FUSE 层**（`internal/fuse/`），在 FUSE server 启动时拉起一个后台 goroutine 周期性执行：
+
+- **接口**：`Verify()` 不进 `api.DataCache` 主接口，而是独立可选接口 `api.CacheVerifier`。FUSE 层用接口断言探测：`if v, ok := dataCache.(api.CacheVerifier); ok { ... }`（INV-7，不强迫所有实现提供巡检）。
+- **生命周期**：goroutine 随 FUSE server `Mount` 启动、随 `Unmount`/`Close` 退出（用 `context.Context` + `time.Ticker` 控制）。
+- **周期**：取 `cache.verifyInterval`，`0` 表示关闭巡检（MVP 默认关闭，部署方按需打开）。
+- **结果处理**：`VerifyResult.Corrupted` 非空时记录 WARN 日志 + 指标计数（Phase 4 接入 Prometheus），损坏文件已被 `Verify` 剔除，后续读自动回源。
+- **实现位置**：Week 3 实现 `internal/fuse/server.go` 时接入（当前 Week 2 已提供 `Verify` 能力与配置项）。
 
 ---
 
@@ -610,6 +622,7 @@ cache:
   highWatermark: 0.85
   lowWatermark: 0.70
   maxFileSize: 1073741824             # 1GB（超过不缓存）
+  verifyInterval: 0s                  # 缓存内容巡检周期 (FUSE 层后台 goroutine), 0=关闭 (§7.4)
 
 prefetch:                             # Phase 2 实现
   enabled: true
@@ -674,6 +687,7 @@ type CacheConfig struct {
     HighWatermark float64 `yaml:"highWatermark"`
     LowWatermark  float64 `yaml:"lowWatermark"`
     MaxFileSize   int64   `yaml:"maxFileSize"`
+    VerifyInterval time.Duration `yaml:"verifyInterval"` // 缓存内容巡检周期, 0=关闭
 }
 
 type FuseConfig struct {
@@ -780,6 +794,9 @@ fuel/
 │   │   ├── meta.go            # MetaCache 实现 (L1 内存 TTL 缓存) [Week 2.3]
 │   │   ├── eviction.go        # LRU 淘汰器 (高低水位)
 │   │   ├── eviction_test.go   # LRU 淘汰单元测试
+│   │   ├── verify.go          # 内容完整性巡检 (MD5 比对, 后台/手动触发)
+│   │   ├── verify_test.go     # 巡检单元测试
+│   │   ├── restart_test.go    # 崩溃恢复 (孤儿临时文件清理) 测试
 │   │   └── index.go           # 缓存索引 (内存 map, 可选 BoltDB 持久化)
 │   ├── metadata/
 │   │   ├── direct.go          # 模式 A: 直查 ObjectStore

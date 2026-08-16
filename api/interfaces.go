@@ -54,3 +54,12 @@ type DataCache interface {
 	// Stats 返回缓存统计。
 	Stats() CacheStats
 }
+
+// CacheVerifier 是 DataCache 的可选能力：缓存内容完整性巡检。
+// FUSE 层通过接口断言使用（if v, ok := dataCache.(CacheVerifier); ok { ... }），
+// 不强迫所有 DataCache 实现提供。用于检测磁盘损坏/bit翻转（ETag 身份校验发现不了的场景）。
+type CacheVerifier interface {
+	// Verify 遍历缓存条目做内容校验，剔除损坏文件（后续读自然 miss 回源）。
+	// 由调用方（如 FUSE 层后台 goroutine）周期性触发，不阻塞读路径。
+	Verify() VerifyResult
+}
