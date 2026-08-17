@@ -232,10 +232,16 @@ func dirStreamFrom(entries []api.DirEntry) fs.DirStream {
 		if e.IsDir {
 			mode = syscall.S_IFDIR
 		}
+		var ino uint64
+		if e.Meta != nil {
+			ino = e.Meta.Inode
+		} else {
+			ino = api.InodeFromPath(e.Name)
+		}
 		list = append(list, fuse.DirEntry{
 			Name: e.Name,
 			Mode: mode,
-			Ino:  e.Meta.Inode,
+			Ino:  ino,
 		})
 	}
 	return fs.NewListDirStream(list)

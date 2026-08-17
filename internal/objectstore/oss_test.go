@@ -96,7 +96,7 @@ func TestMockStore_Contract(t *testing.T) {
 	}
 }
 
-// TestMockStore_NotFound 验证不存在对象返回 ENOENT。
+// TestMockStore_NotFound 验证不存在对象返回 ENOENT（Delete 除外：OSS Delete 是幂等的，不存在时不报错）。
 func TestMockStore_NotFound(t *testing.T) {
 	store := NewMockStore("b")
 	ctx := context.Background()
@@ -107,8 +107,9 @@ func TestMockStore_NotFound(t *testing.T) {
 	if _, err := store.Get(ctx, "missing", 0, 0); !errors.Is(err, syscall.ENOENT) {
 		t.Errorf("Get: expected ENOENT, got %v", err)
 	}
-	if err := store.Delete(ctx, "missing"); !errors.Is(err, syscall.ENOENT) {
-		t.Errorf("Delete: expected ENOENT, got %v", err)
+	// Delete 是幂等的（与真实 OSS 行为一致）：删除不存在的对象不报错
+	if err := store.Delete(ctx, "missing"); err != nil {
+		t.Errorf("Delete: expected nil (idempotent), got %v", err)
 	}
 	if err := store.Copy(ctx, "missing", "dst"); !errors.Is(err, syscall.ENOENT) {
 		t.Errorf("Copy: expected ENOENT, got %v", err)

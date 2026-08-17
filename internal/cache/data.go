@@ -99,7 +99,9 @@ func (c *nvmeCache) Get(key, etag string) (localPath string, hit bool, err error
 
 // Put 流式写入整文件缓存（临时文件 + fsync + atomic rename），返回本地文件路径。
 // size > maxFileSize 时不缓存，返回错误（上层降级为直透对象存储）。
-// 写入前若超过高水位则触发 LRU 淘汰；写入遇 ENOSPC 时再淘汰重试一次。
+// 写入前若超过高水位则触发 LRU 淘汰。
+// 注意：io.Reader 只能消费一次，ENOSPC 时不重试（reader 已被消费），返回错误由调用方
+// （singleflight）重新发起完整的 GET + Put 流程。
 func (c *nvmeCache) Put(key, etag string, size int64, r io.Reader) (localPath string, err error) {
 	if !sanitizeKey(key) {
 		return "", fmt.Errorf("invalid cache key %q", key)
@@ -120,13 +122,12 @@ func (c *nvmeCache) Put(key, etag string, size int64, r io.Reader) (localPath st
 	written, err := c.writeTmpAndRename(finalPath, r)
 	if err != nil {
 		if errors.Is(err, syscall.ENOSPC) {
-			// 磁盘满 → 再淘汰一次后重试
+			// 磁盘满 → 淘汰腾出空间以便下次 Put 成功。
+			// 不重试本次写入：io.Reader 已被消费，无法重读。
+			// 调用方（singleflight.Do）会在下次访问时重新 GET + Put。
 			c.evictFor(size)
-			written, err = c.writeTmpAndRename(finalPath, r)
 		}
-		if err != nil {
-			return "", fmt.Errorf("write cache %s: %w", key, err)
-		}
+		return "", fmt.Errorf("write cache %s: %w", key, err)
 	}
 
 	c.index.put(&cacheEntry{

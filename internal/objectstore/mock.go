@@ -3,6 +3,8 @@ package objectstore
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"sort"
@@ -144,9 +146,6 @@ func (m *mockStore) Copy(ctx context.Context, srcKey, dstKey string) error {
 func (m *mockStore) Delete(ctx context.Context, key string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.objects[key]; !ok {
-		return fmt.Errorf("object %s: %w", key, syscall.ENOENT)
-	}
 	delete(m.objects, key)
 	return nil
 }
@@ -155,7 +154,8 @@ func (m *mockStore) Bucket() string {
 	return m.bucket
 }
 
-// mockETag 生成确定性的测试 ETag。
+// mockETag 生成内容相关的确定性 ETag（模拟 OSS 整文件上传的 ETag = 内容 MD5）。
 func mockETag(key string, data []byte) string {
-	return fmt.Sprintf("etag-%s-%d", key, len(data))
+	sum := md5.Sum(data)
+	return hex.EncodeToString(sum[:])
 }
