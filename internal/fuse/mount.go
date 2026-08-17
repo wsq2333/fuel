@@ -43,11 +43,13 @@ func Mount(root *FuelRoot, cfg *config.Config) (*fuse.Server, error) {
 		maxRead = 1 << 20
 	}
 
+	// 4.4 FUSE 内核参数调优: MaxBackground=128 提高并发请求队列，
+	// Options 默认含 large_read/kernel_cache/auto_cache（用户可覆盖）。
 	server, err := fuse.NewServer(nodeFS, mountPoint, &fuse.MountOptions{
 		AllowOther:    true,
 		MaxWrite:      maxRead,
 		MaxReadAhead:  maxRead,
-		MaxBackground: 16,
+		MaxBackground: 128,
 		FsName:        "fuel-" + cfg.Storage.Bucket,
 		Name:          "fuel",
 		Options:       cfg.Fuse.Options,

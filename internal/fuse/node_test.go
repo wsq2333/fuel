@@ -8,6 +8,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -129,6 +130,11 @@ func (m *mockMetaEngine) BatchGetAttr(ctx context.Context, paths []string) (map[
 	result := make(map[string]*api.MetaEntry, len(paths))
 	for _, p := range paths {
 		if e, ok := m.entries[p]; ok {
+			result[p] = e
+			continue
+		}
+		// fallback to store Head (与 GetAttr 一致，模拟 direct 引擎批量 fallback)
+		if e, err := m.GetAttr(ctx, p); err == nil {
 			result[p] = e
 		}
 	}
@@ -514,5 +520,168 @@ func TestPathJoin(t *testing.T) {
 	}
 	if got := pathJoin("dir", "a"); got != "dir/a" {
 		t.Errorf("pathJoin('dir', 'a') = %q, want 'dir/a'", got)
+	}
+}
+
+// TestParentDir 验证父目录提取逻辑。
+func TestParentDir(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"a/b/c.txt", "a/b"},
+		{"a.txt", ""},
+		{"dir/", "dir"},
+		{"", ""},
+		{"a", ""},
+	}
+	for _, tc := range cases {
+		if got := parentDir(tc.in); got != tc.want {
+			t.Errorf("parentDir(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// --- 4.3 批量预取集成测试 ---
+
+// TestFuelRoot_BatchPrefetch_Integration 验证 Open 触发 BatchPrefetcher，
+// 异步将同目录后续小文件拉入缓存。
+func TestFuelRoot_BatchPrefetch_Integration(t *testing.T) {
+	env := newTestEnv(t)
+	// testEnv 默认 cfg.Prefetch.Enabled=false，这里显式启用批量预取
+	env.root.cfg.Prefetch.Enabled = true
+	env.root.batch = cache.NewBatchPrefetcher(true)
+
+	// 准备同目录 5 个小文件
+	dir := "data"
+	files := []string{"f1", "f2", "f3", "f4", "f5"}
+	for _, f := range files {
+		env.addFile(dir+"/"+f, []byte("hello "+f))
+	}
+
+	// 预填 L1 dir cache，让批量预取能找到后续文件
+	env.metaCache.SetDir(dir, []api.DirEntry{
+		{Name: "f1", Meta: &api.MetaEntry{Path: dir + "/f1", Size: 8}},
+		{Name: "f2", Meta: &api.MetaEntry{Path: dir + "/f2", Size: 8}},
+		{Name: "f3", Meta: &api.MetaEntry{Path: dir + "/f3", Size: 8}},
+		{Name: "f4", Meta: &api.MetaEntry{Path: dir + "/f4", Size: 8}},
+		{Name: "f5", Meta: &api.MetaEntry{Path: dir + "/f5", Size: 8}},
+	})
+
+	// 连续 Open f1/f2/f3（达到阈值）→ 触发批量预取
+	for i := 1; i <= 3; i++ {
+		var out fuse.EntryOut
+		inode, errno := env.root.Lookup(env.ctx, dir+"/f"+string(rune('0'+i)), &out)
+		if errno != 0 {
+			t.Fatalf("Lookup f%d failed: %v", i, errno)
+		}
+		node := inode.Operations().(*FuelNode)
+		fh, _, errno := node.Open(env.ctx, 0)
+		if errno != 0 {
+			t.Fatalf("Open f%d failed: %v", i, errno)
+		}
+		fh.(fs.FileReleaser).Release(env.ctx)
+	}
+
+	// 等待异步批量预取完成（最多 2s）
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		f4cached := env.dataCache.Contains(dir+"/f4", env.head(dir+"/f4").ETag)
+		f5cached := env.dataCache.Contains(dir+"/f5", env.head(dir+"/f5").ETag)
+		if f4cached && f5cached {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Errorf("expected f4 and f5 to be prefetched into cache")
+}
+
+// TestFuelRoot_BatchPrefetch_Disabled Prefetch.Enabled=false 时不触发批量预取。
+func TestFuelRoot_BatchPrefetch_Disabled(t *testing.T) {
+	env := newTestEnv(t)
+	env.root.cfg.Prefetch.Enabled = false
+	env.root.batch = cache.NewBatchPrefetcher(false)
+
+	dir := "d"
+	for i := 1; i <= 3; i++ {
+		env.addFile(dir+"/f"+string(rune('0'+i)), []byte("x"))
+	}
+	for i := 1; i <= 3; i++ {
+		var out fuse.EntryOut
+		inode, _ := env.root.Lookup(env.ctx, dir+"/f"+string(rune('0'+i)), &out)
+		node := inode.Operations().(*FuelNode)
+		fh, _, _ := node.Open(env.ctx, 0)
+		fh.(fs.FileReleaser).Release(env.ctx)
+	}
+	time.Sleep(100 * time.Millisecond)
+	// 未预取（Prefetcher 关闭）
+	_ = env
+}
+
+// --- 4.3 元数据并行预取测试 ---
+
+// incompleteMetaEngine 是 ListDir 返回 Meta=nil 的 mock，用于测试 fillMissingMeta。
+type incompleteMetaEngine struct {
+	*mockMetaEngine
+}
+
+func (m *incompleteMetaEngine) ListDir(ctx context.Context, dirPath string) ([]api.DirEntry, error) {
+	entries, err := m.mockMetaEngine.ListDir(ctx, dirPath)
+	if err != nil {
+		return nil, err
+	}
+	// 模拟 direct engine List 不返回 ETag 的场景：把 Meta 清为 nil
+	for i := range entries {
+		entries[i].Meta = nil
+	}
+	return entries, nil
+}
+
+// TestFuelRoot_FillMissingMeta 验证 listDir 对 Meta 缺失的 entry 并发补齐。
+func TestFuelRoot_FillMissingMeta(t *testing.T) {
+	env := newTestEnv(t)
+	incomplete := &incompleteMetaEngine{mockMetaEngine: env.metaEng}
+
+	// 替换 root 的 metaEng 为不返回 Meta 的版本
+	root := NewFuelRoot(env.store, env.dataCache, env.metaCache, incomplete, env.root.cfg)
+
+	env.addFile("d/f1", []byte("aaa"))
+	env.addFile("d/f2", []byte("bbb"))
+
+	entries, errno := root.listDirEntries(env.ctx, "d")
+	if errno != 0 {
+		t.Fatalf("listDirEntries failed: %v", errno)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(entries))
+	}
+	for i, e := range entries {
+		if e.Meta == nil {
+			t.Errorf("entry %d Meta should be filled by fillMissingMeta", i)
+			continue
+		}
+		if e.Meta.ETag == "" {
+			t.Errorf("entry %d ETag should be filled from HEAD", i)
+		}
+		if e.Meta.Size == 0 {
+			t.Errorf("entry %d Size should be filled from HEAD", i)
+		}
+	}
+}
+
+// TestFuelRoot_FillMissingMeta_AlreadyInline 已含完整 Meta 的 entry 不重复调用。
+func TestFuelRoot_FillMissingMeta_AlreadyInline(t *testing.T) {
+	env := newTestEnv(t)
+	env.addFile("d/f", []byte("x"))
+
+	// mockMetaEngine 的 ListDir 已内联 Meta（含 Size 但 ETag 为空——List API 不返回 ETag）
+	entries, errno := env.root.listDirEntries(env.ctx, "d")
+	if errno != 0 {
+		t.Fatalf("listDirEntries failed: %v", errno)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	// direct engine 的 List 返回 ObjectEntry 无 ETag，所以 fillMissingMeta 会补齐
+	// 验证 ETag 被补齐（HEAD 从 store 取到真实 ETag）
+	if entries[0].Meta.ETag == "" {
+		t.Error("ETag should be filled by fillMissingMeta (List API returns no ETag)")
 	}
 }

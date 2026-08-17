@@ -370,3 +370,109 @@ func (c *nvmeCache) finalizeTmp(tmp *os.File, tmpPath, finalPath string) error {
 	}
 	return nil
 }
+
+// 4.3 小文件批量预取 (PLAN §4.3)。
+// 检测同目录连续小文件 Open（如 PyTorch DataLoader 顺序扫一个目录的样本），
+// 当连续数超过 triggerThreshold 时，异步批量预取同目录下后续 batchSize 个文件。
+// 小文件判定: size <= smallFileThreshold（默认 1MB）。
+// 静默失败（优化性质，不影响主路径）。
+const (
+	batchPrefetchTriggerThreshold = 3
+	batchPrefetchBatchSize        = 7
+	smallFileThreshold            = 1 << 20 // 1MB
+)
+
+// BatchPrefetcher 跟踪同目录的连续 Open 行为，触发批量预取。
+// 线程安全；状态只在 Open 时更新。
+type BatchPrefetcher struct {
+	mu sync.Mutex
+
+	lastDir    string // 上一次 Open 的目录
+	consec     int    // 同目录连续 Open 次数
+	prefetched map[string]struct{} // 已预取的目录（避免重复触发）
+
+	enabled bool
+}
+
+// NewBatchPrefetcher 构造批量预取器。
+func NewBatchPrefetcher(enabled bool) *BatchPrefetcher {
+	return &BatchPrefetcher{
+		enabled:    enabled,
+		prefetched: make(map[string]struct{}),
+	}
+}
+
+// OnOpen 在文件 Open 时调用，跟踪同目录连续 Open 并决定是否触发批量预取。
+// 返回 true 表示应触发批量预取；调用方在 goroutine 中执行实际预取。
+// size 用于判定是否为小文件（<= smallFileThreshold 才计入连续计数）。
+func (b *BatchPrefetcher) OnOpen(dir string, size int64) bool {
+	if !b.enabled || size > smallFileThreshold {
+		return false
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if dir == b.lastDir {
+		b.consec++
+	} else {
+		b.lastDir = dir
+		b.consec = 1
+	}
+
+	if b.consec < batchPrefetchTriggerThreshold {
+		return false
+	}
+	if _, done := b.prefetched[dir]; done {
+		return false
+	}
+	b.prefetched[dir] = struct{}{}
+	return true
+}
+
+// Reset 清空跟踪状态（目录 TTL 失效或显式重置时调用）。
+func (b *BatchPrefetcher) Reset(dir string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.prefetched, dir)
+	if b.lastDir == dir {
+		b.lastDir = ""
+		b.consec = 0
+	}
+}
+
+// prefetchAfter 返回批量预取的目标：dirPath 下除已打开文件外的前 batchSize 个小文件。
+// 调用方持有 entries（来自 metaCache.GetDir 或 listDir），此处仅过滤和截断。
+// 返回的 key 是完整对象 key（pathJoin(dir, name)）。
+func PrefetchAfter(dirPath string, opened string, entries []api.DirEntry, limit int) []string {
+	if limit <= 0 {
+		limit = batchPrefetchBatchSize
+	}
+	out := make([]string, 0, limit)
+	for _, e := range entries {
+		if e.IsDir || e.Meta == nil {
+			continue
+		}
+		key := pathJoinKey(dirPath, e.Name)
+		if key == opened {
+			continue
+		}
+		if e.Meta.Size > smallFileThreshold {
+			continue
+		}
+		out = append(out, key)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+// pathJoinKey 拼接目录与文件名，返回对象存储 key。
+// 与 fuse 包 pathJoin 一致，但定义在 cache 包内避免循环依赖。
+func pathJoinKey(parent, name string) string {
+	if parent == "" {
+		return name
+	}
+	return parent + "/" + name
+}

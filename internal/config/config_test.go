@@ -231,3 +231,61 @@ storage:
 		t.Errorf("expected default verifyInterval 0 (disabled), got %v", cfg.Cache.VerifyInterval)
 	}
 }
+
+// TestLoad_FuseOptionsDefaults 验证 4.4 FUSE 内核参数默认调优 (PLAN §4.4)。
+// 默认 Options 应含 large_read / kernel_cache / auto_cache。
+func TestLoad_FuseOptionsDefaults(t *testing.T) {
+	yaml := `
+storage:
+  type: oss
+  bucket: b
+  oss:
+    endpoint: e
+`
+	path := writeTempConfig(t, yaml)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	want := map[string]bool{
+		"large_read":   false,
+		"kernel_cache": false,
+		"auto_cache":   false,
+	}
+	for _, opt := range cfg.Fuse.Options {
+		if _, ok := want[opt]; ok {
+			want[opt] = true
+		}
+	}
+	for opt, found := range want {
+		if !found {
+			t.Errorf("default Fuse.Options should contain %q, got %v", opt, cfg.Fuse.Options)
+		}
+	}
+}
+
+// TestLoad_FuseOptionsUserOverride 验证用户可通过 YAML 覆盖 Fuse.Options。
+func TestLoad_FuseOptionsUserOverride(t *testing.T) {
+	yaml := `
+storage:
+  type: oss
+  bucket: b
+  oss:
+    endpoint: e
+fuse:
+  options:
+    - ro
+    - direct_io
+`
+	path := writeTempConfig(t, yaml)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if len(cfg.Fuse.Options) != 2 {
+		t.Errorf("expected 2 user options, got %v", cfg.Fuse.Options)
+	}
+	if cfg.Fuse.Options[0] != "ro" || cfg.Fuse.Options[1] != "direct_io" {
+		t.Errorf("user options mismatch: %v", cfg.Fuse.Options)
+	}
+}

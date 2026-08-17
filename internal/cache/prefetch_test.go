@@ -619,3 +619,137 @@ func countOrphanTemps(t *testing.T, c api.DataCache) int {
 	})
 	return count
 }
+
+// --- 4.3 BatchPrefetcher 测试 ---
+
+// TestBatchPrefetcher_TriggerOnThreshold 同目录连续 3 次小文件 Open 触发批量预取。
+func TestBatchPrefetcher_TriggerOnThreshold(t *testing.T) {
+	bp := NewBatchPrefetcher(true)
+	for i := 0; i < batchPrefetchTriggerThreshold-1; i++ {
+		if bp.OnOpen("d", 100) {
+			t.Fatalf("OnOpen #%d should not trigger yet", i)
+		}
+	}
+	if !bp.OnOpen("d", 100) {
+		t.Error("OnOpen at threshold should trigger")
+	}
+}
+
+// TestBatchPrefetcher_OncePerDir 同目录仅触发一次，后续 Open 不再触发。
+func TestBatchPrefetcher_OncePerDir(t *testing.T) {
+	bp := NewBatchPrefetcher(true)
+	for i := 0; i < batchPrefetchTriggerThreshold; i++ {
+		bp.OnOpen("d", 100)
+	}
+	for i := 0; i < 3; i++ {
+		if bp.OnOpen("d", 100) {
+			t.Error("should not trigger again for same dir")
+		}
+	}
+}
+
+// TestBatchPrefetcher_DirChangeResetsConsec 切换目录重置连续计数。
+func TestBatchPrefetcher_DirChangeResetsConsec(t *testing.T) {
+	bp := NewBatchPrefetcher(true)
+	bp.OnOpen("a", 100)
+	bp.OnOpen("a", 100)
+	// 切到 b，计数从 1 开始
+	if bp.OnOpen("b", 100) {
+		t.Error("dir switch should reset consec, no trigger")
+	}
+	// 回 a，consec 也从 1 开始
+	if bp.OnOpen("a", 100) {
+		t.Error("dir switch back should reset consec, no trigger")
+	}
+}
+
+// TestBatchPrefetcher_LargeFileSkipped 大文件不计入连续计数也不触发。
+func TestBatchPrefetcher_LargeFileSkipped(t *testing.T) {
+	bp := NewBatchPrefetcher(true)
+	large := int64(smallFileThreshold + 1)
+	for i := 0; i < 5; i++ {
+		if bp.OnOpen("d", large) {
+			t.Errorf("large file should not trigger (size=%d)", large)
+		}
+	}
+	// 大文件穿插也不污染小文件计数
+	bp.OnOpen("d", 100)
+	if bp.OnOpen("d", large) {
+		t.Error("large file interleave should not trigger")
+	}
+	if bp.OnOpen("d", 100) {
+		t.Error("large file should not advance consec counter")
+	}
+}
+
+// TestBatchPrefetcher_Disabled 禁用时任何 Open 不触发。
+func TestBatchPrefetcher_Disabled(t *testing.T) {
+	bp := NewBatchPrefetcher(false)
+	for i := 0; i < 10; i++ {
+		if bp.OnOpen("d", 100) {
+			t.Error("disabled prefetcher should never trigger")
+		}
+	}
+}
+
+// TestBatchPrefetcher_Reset Reset 清除触发记录，同目录可再次触发。
+func TestBatchPrefetcher_Reset(t *testing.T) {
+	bp := NewBatchPrefetcher(true)
+	for i := 0; i < batchPrefetchTriggerThreshold; i++ {
+		bp.OnOpen("d", 100)
+	}
+	bp.Reset("d")
+	// 重新计数到阈值
+	for i := 0; i < batchPrefetchTriggerThreshold-1; i++ {
+		if bp.OnOpen("d", 100) {
+			t.Fatal("after Reset, count restarts, no trigger")
+		}
+	}
+	if !bp.OnOpen("d", 100) {
+		t.Error("after Reset and reaching threshold again, should trigger")
+	}
+}
+
+// TestPrefetchAfter_Filters 过滤已打开/目录项/大文件，仅返回小文件。
+func TestPrefetchAfter_Filters(t *testing.T) {
+	entries := []api.DirEntry{
+		{Name: "a", Meta: &api.MetaEntry{Size: 100}},
+		{Name: "b", Meta: &api.MetaEntry{Size: 200}},
+		{Name: "big", Meta: &api.MetaEntry{Size: smallFileThreshold + 1}},
+		{Name: "sub", IsDir: true, Meta: &api.MetaEntry{}},
+		{Name: "c", Meta: nil},
+		{Name: "opened", Meta: &api.MetaEntry{Size: 50}},
+		{Name: "d", Meta: &api.MetaEntry{Size: 300}},
+	}
+	got := PrefetchAfter("", "opened", entries, 0)
+	want := []string{"a", "b", "d"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("PrefetchAfter got %v, want %v", got, want)
+	}
+}
+
+// TestPrefetchAfter_PathJoin 非空 dirPath 正确拼接 key。
+func TestPrefetchAfter_PathJoin(t *testing.T) {
+	entries := []api.DirEntry{
+		{Name: "x", Meta: &api.MetaEntry{Size: 10}},
+	}
+	got := PrefetchAfter("d1/d2", "d1/d2/other", entries, 0)
+	if len(got) != 1 || got[0] != "d1/d2/x" {
+		t.Errorf("expected [d1/d2/x], got %v", got)
+	}
+}
+
+// TestPrefetchAfter_Limit 限制返回数量。
+func TestPrefetchAfter_Limit(t *testing.T) {
+	entries := make([]api.DirEntry, 0, 10)
+	for i := 0; i < 10; i++ {
+		entries = append(entries, api.DirEntry{
+			Name: fmt.Sprintf("f%d", i),
+			Meta: &api.MetaEntry{Size: 10},
+		})
+	}
+	got := PrefetchAfter("", "other", entries, 3)
+	if len(got) != 3 {
+		t.Errorf("expected 3 entries, got %v", got)
+	}
+}

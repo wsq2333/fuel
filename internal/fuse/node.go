@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"syscall"
 
 	"github.com/hanwen/go-fuse/v2/fs"
@@ -25,6 +26,7 @@ type FuelRoot struct {
 	metaEng   api.MetadataEngine
 	flight    singleflight.Group
 	cfg       *config.Config
+	batch     *cache.BatchPrefetcher // 小文件批量预取 (PLAN §4.3)
 	uid       uint32
 	gid       uint32
 }
@@ -43,6 +45,7 @@ func NewFuelRoot(
 		metaCache: metaCache,
 		metaEng:   metaEng,
 		cfg:       cfg,
+		batch:     cache.NewBatchPrefetcher(cfg.Prefetch.Enabled),
 		uid:       uint32(os.Getuid()),
 		gid:       uint32(os.Getgid()),
 	}
@@ -145,6 +148,35 @@ func (r *FuelRoot) fetchAndCache(ctx context.Context, key, etag string, size int
 	return v.(string), nil
 }
 
+// prefetchBatch 异步批量预取 dirPath 下除 opened 外的后续小文件 (PLAN §4.3)。
+// 复用 listDirEntries 获取目录 entries（多数场景命中 L1 dir cache，因为 PyTorch
+// 通常先 readdir 再批量 open）。对每个未缓存的小文件调用 fetchAndCache（singleflight
+// 自动去重，已并发拉取的不会再拉）。
+// 静默失败（优化性质，不影响主路径）。
+func (r *FuelRoot) prefetchBatch(ctx context.Context, opened string) {
+	dir := parentDir(opened)
+	go func() {
+		bgCtx := context.Background()
+		entries, errno := r.listDirEntries(bgCtx, dir)
+		if errno != 0 {
+			return
+		}
+		targets := cache.PrefetchAfter(dir, opened, entries, 0)
+		for _, key := range targets {
+			if _, hit, err := r.dataCache.Get(key, ""); err != nil || hit {
+				continue
+			}
+			me, errno := r.getAttr(bgCtx, key)
+			if errno != 0 || me == nil {
+				continue
+			}
+			if _, err := r.fetchAndCache(bgCtx, key, me.ETag, me.Size); err != nil {
+				continue
+			}
+		}
+	}()
+}
+
 // --- FuelRoot 自身作为根目录的 Node 方法 ---
 
 // Lookup 查找根目录下的直接子项。
@@ -205,14 +237,29 @@ func (n *FuelNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 // listDir 列出 dirPath 的直接子项，按 L1 → L2 → 真相来源 顺序查询。
 // 命中 L2/真相来源时写回各级缓存，并将每个子项 Meta 预填充到 stat 缓存。
 func (r *FuelRoot) listDir(ctx context.Context, dirPath string) (fs.DirStream, syscall.Errno) {
+	entries, errno := r.listDirEntries(ctx, dirPath)
+	if errno != 0 {
+		return nil, errno
+	}
+	return dirStreamFrom(entries), 0
+}
+
+// listDirEntries 返回 dirPath 的 []DirEntry（不写 DirStream 包装）。
+// 命中 L1 dir cache 直接返回；miss 时回源 ListDir，写回 L1 dir cache，
+// 并将每个子项 Meta 预填充到 L1 stat 缓存（避免后续 stat N+1）。
+// 若某子项 Meta 为 nil（ListDir 实现未内联元数据），并发调用 BatchGetAttr 补齐
+// (PLAN §4.3 readdir 元数据并行预取)。
+func (r *FuelRoot) listDirEntries(ctx context.Context, dirPath string) ([]api.DirEntry, syscall.Errno) {
 	if entries, ok := r.metaCache.GetDir(dirPath); ok {
-		return dirStreamFrom(entries), 0
+		return entries, 0
 	}
 
 	entries, err := r.metaEng.ListDir(ctx, dirPath)
 	if err != nil {
 		return nil, syscall.EIO
 	}
+
+	r.fillMissingMeta(ctx, dirPath, entries)
 
 	r.metaCache.SetDir(dirPath, entries)
 	for i := range entries {
@@ -221,7 +268,38 @@ func (r *FuelRoot) listDir(ctx context.Context, dirPath string) (fs.DirStream, s
 			r.metaCache.SetStat(childPath, entries[i].Meta)
 		}
 	}
-	return dirStreamFrom(entries), 0
+	return entries, 0
+}
+
+// fillMissingMeta 对 entries 中 Meta 为 nil 或 Meta.ETag 为空的项，
+// 通过 metaEng.BatchGetAttr 批量补齐元数据（readdir 元数据并行预取）。
+// 单发 BatchGetAttr 调用让 Redis/MySQL 引擎能用 MGET/pipeline 并发 N 个 HEAD，
+// direct 引擎则内部并发 fallback 到 GetAttr。
+func (r *FuelRoot) fillMissingMeta(ctx context.Context, dirPath string, entries []api.DirEntry) {
+	var paths []string
+	var idxs []int
+	for i, e := range entries {
+		if e.IsDir {
+			continue
+		}
+		if e.Meta != nil && e.Meta.ETag != "" {
+			continue
+		}
+		paths = append(paths, pathJoin(dirPath, e.Name))
+		idxs = append(idxs, i)
+	}
+	if len(paths) == 0 {
+		return
+	}
+	fetched, err := r.metaEng.BatchGetAttr(ctx, paths)
+	if err != nil {
+		return
+	}
+	for j, p := range paths {
+		if me, ok := fetched[p]; ok && me != nil {
+			entries[idxs[j]].Meta = me
+		}
+	}
 }
 
 // dirStreamFrom 将 []api.DirEntry 转换为 fs.DirStream。
@@ -277,7 +355,22 @@ func (n *FuelNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint3
 	if errno != 0 {
 		return nil, 0, errno
 	}
+
+	// 4.3 小文件批量预取：检测同目录连续小文件 Open，触发异步预取后续文件。
+	if n.root.batch.OnOpen(parentDir(n.path), me.Size) {
+		n.root.prefetchBatch(ctx, n.path)
+	}
+
 	return fh, fuse.FOPEN_KEEP_CACHE, 0
+}
+
+// parentDir 返回对象 key 的父目录（无 "/" 时为 ""）。
+func parentDir(key string) string {
+	i := strings.LastIndex(key, "/")
+	if i < 0 {
+		return ""
+	}
+	return key[:i]
 }
 
 // Read 从文件读取数据。缓存命中时 pread 本地文件；未命中时 singleflight 拉取后 pread。

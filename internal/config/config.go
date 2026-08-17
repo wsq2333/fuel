@@ -178,6 +178,7 @@ func defaultConfig() *Config {
 	cfg.Prefetch.Readahead.Initial = 1048576
 	cfg.Prefetch.Readahead.Max = 16777216
 	cfg.Fuse.MaxRead = 1048576
+	cfg.Fuse.Options = []string{"large_read", "kernel_cache", "auto_cache"}
 	cfg.Monitor.MetricsAddr = ":49999"
 	cfg.Monitor.LogLevel = "info"
 	return cfg
