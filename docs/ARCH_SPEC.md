@@ -835,3 +835,4 @@ type Config struct {
 | go-alluxio-fuse-feasibility.md | `design/go-alluxio-fuse-feasibility.md` | Go Alluxio FUSE 可行性 |
 | alluxio_arch.md | `design/alluxio_arch.md` | 现有 Alluxio 架构 |
 | PAGE_STORE_DECISION.md | `docs/PAGE_STORE_DECISION.md` | PageStore vs 整文件缓存设计决策 |
+| FUSE_LIB_DECISION.md | `docs/FUSE_LIB_DECISION.md` | FUSE 库选型决策（hanwen/go-fuse vs libfuse） |
