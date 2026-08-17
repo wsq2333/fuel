@@ -2,11 +2,17 @@ package cache
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 
 	"fuel/api"
+	"golang.org/x/sync/errgroup"
 )
 
 // Prefetcher 是单个文件的预读状态管理器（借鉴 goofys 设计）。
@@ -152,4 +158,215 @@ func (p *Prefetcher) Reset() {
 	p.lastOffset = 0
 	p.readaheadSize = p.initialReadahead
 	p.oooReadCount = 0
+}
+
+const (
+	defaultConcurrentBlockSize = 4 << 20 // 4MB
+	defaultConcurrency          = 4
+)
+
+var _ api.ConcurrentPutter = (*nvmeCache)(nil)
+
+// PutConcurrent 并发拉取整对象并写入缓存 (PLAN §4.2)。
+//
+// 缓存未命中大文件（size > blockSize）时，按 blockSize 切分为多个 block，
+// 并发 goroutine 各自发起 GET Range [blockStart, blockEnd)，
+// 用 pwrite (os.File.WriteAt) 写入同一临时文件对应偏移。
+// 全部 block 成功后 fsync + atomic rename 为正式缓存文件并注册索引 (INV-2 整文件缓存)。
+// 任意 block 失败 → 等待其他 goroutine 退出 → 清理临时文件 → 返回错误，
+// 不污染索引（拉取中断/半拉取不入库，IMPL_DESIGN §7.3）。
+//
+// 磁盘错误（ENOSPC/EIO）和网络错误（GET Range 失败）均导致整体失败，
+// 调用方（singleflight.Do）会在下次访问时重新发起完整拉取。
+func (c *nvmeCache) PutConcurrent(
+	ctx context.Context,
+	key, etag string,
+	size int64,
+	store api.ObjectStore,
+	concurrency, blockSize int64,
+) (localPath string, err error) {
+	if !sanitizeKey(key) {
+		return "", fmt.Errorf("invalid cache key %q", key)
+	}
+	if size <= 0 {
+		return "", fmt.Errorf("size must be positive, got %d", size)
+	}
+	if store == nil {
+		return "", fmt.Errorf("ObjectStore is required")
+	}
+	if c.maxFileSize > 0 && size > c.maxFileSize {
+		return "", fmt.Errorf("file %s size %d exceeds maxFileSize %d, skip caching", key, size, c.maxFileSize)
+	}
+	if blockSize <= 0 {
+		blockSize = defaultConcurrentBlockSize
+	}
+	if concurrency <= 0 {
+		concurrency = defaultConcurrency
+	}
+	if concurrency > (size+blockSize-1)/blockSize {
+		concurrency = (size + blockSize - 1) / blockSize
+	}
+
+	finalPath := c.localPath(key)
+	if err := os.MkdirAll(filepath.Dir(finalPath), 0o755); err != nil {
+		return "", fmt.Errorf("create cache dir for %s: %w", key, err)
+	}
+
+	if c.needEviction(size) {
+		c.evictFor(size)
+	}
+
+	tmp, tmpPath, err := c.createConcurrentTmp(finalPath, size)
+	if err != nil {
+		return "", fmt.Errorf("create tmp for %s: %w", key, err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tmp.Close()
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	blocks := planBlocks(size, blockSize)
+	if gerr := c.fetchBlocksConcurrently(ctx, store, key, tmp, blocks, concurrency); gerr != nil {
+		err = gerr
+		return "", fmt.Errorf("concurrent fetch %s: %w", key, gerr)
+	}
+
+	if err = c.finalizeTmp(tmp, tmpPath, finalPath); err != nil {
+		return "", fmt.Errorf("finalize cache %s: %w", key, err)
+	}
+
+	c.index.put(&cacheEntry{
+		Key:       key,
+		ETag:      etag,
+		Size:      size,
+		LocalPath: finalPath,
+	})
+	return finalPath, nil
+}
+
+// blockRange 描述一个待拉取的 block 范围 [start, end)，end <= size。
+type blockRange struct {
+	start, end int64
+}
+
+// planBlocks 按 blockSize 切分 [0, size) 为连续 block 列表。
+func planBlocks(size, blockSize int64) []blockRange {
+	var blocks []blockRange
+	for off := int64(0); off < size; off += blockSize {
+		end := off + blockSize
+		if end > size {
+			end = size
+		}
+		blocks = append(blocks, blockRange{start: off, end: end})
+	}
+	return blocks
+}
+
+// createConcurrentTmp 创建临时文件并预分配 size 字节（避免并发 pwrite 时碎片化）。
+// 使用 fallocate 失败不致命（如文件系统不支持），仅记录。
+func (c *nvmeCache) createConcurrentTmp(finalPath string, size int64) (*os.File, string, error) {
+	dir := filepath.Dir(finalPath)
+	tmp, err := os.CreateTemp(dir, tmpFilePrefix+"*")
+	if err != nil {
+		return nil, "", fmt.Errorf("create tmp: %w", err)
+	}
+	tmpPath := tmp.Name()
+	if err := tmp.Truncate(size); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return nil, "", fmt.Errorf("truncate tmp to %d: %w", size, err)
+	}
+	return tmp, tmpPath, nil
+}
+
+// fetchBlocksConcurrently 并发拉取所有 block，每个 goroutine pwrite 到对应偏移。
+// 任意 block 失败 → errgroup 短路其余 goroutine，等待全部退出后返回首个错误。
+// concurrency 限制同时进行的 GET Range 数量（信号量）。
+func (c *nvmeCache) fetchBlocksConcurrently(
+	ctx context.Context,
+	store api.ObjectStore,
+	key string,
+	dst *os.File,
+	blocks []blockRange,
+	concurrency int64,
+) error {
+	g, gctx := errgroup.WithContext(ctx)
+	sem := make(chan struct{}, concurrency)
+
+	for i := range blocks {
+		b := blocks[i]
+		select {
+		case sem <- struct{}{}:
+		case <-gctx.Done():
+			return gctx.Err()
+		}
+		g.Go(func() error {
+			defer func() { <-sem }()
+			return c.fetchBlock(gctx, store, key, dst, b)
+		})
+	}
+	return g.Wait()
+}
+
+// fetchBlock 拉取单个 block 并 pwrite 到临时文件对应偏移。
+// 复用 errgroup 上下文：gctx 取消时未启动的 block 不再发起 GET。
+func (c *nvmeCache) fetchBlock(
+	ctx context.Context,
+	store api.ObjectStore,
+	key string,
+	dst *os.File,
+	b blockRange,
+) error {
+	length := b.end - b.start
+	reader, err := store.Get(ctx, key, b.start, length)
+	if err != nil {
+		return fmt.Errorf("GET %s [%d,%d): %w", key, b.start, b.end, err)
+	}
+	defer reader.Close()
+
+	written, err := io.Copy(&pwriteAtWriter{f: dst, off: b.start}, reader)
+	if err != nil {
+		if errors.Is(err, syscall.ENOSPC) {
+			return fmt.Errorf("pwrite %s @%d: %w (disk full)", key, b.start, err)
+		}
+		return fmt.Errorf("pwrite %s @%d: %w", key, b.start, err)
+	}
+	if written != length {
+		return fmt.Errorf("short block %s [%d,%d): wrote %d, want %d", key, b.start, b.end, written, length)
+	}
+	return nil
+}
+
+// pwriteAtWriter 适配 io.Copy 到 os.File.WriteAt，固定起始偏移。
+// 每次 Write 调用推进 off；多个 goroutine 各自持独立实例，pwrite 互不影响。
+type pwriteAtWriter struct {
+	f   *os.File
+	off int64
+}
+
+func (w *pwriteAtWriter) Write(p []byte) (int, error) {
+	n, err := w.f.WriteAt(p, w.off)
+	if err != nil {
+		return n, err
+	}
+	w.off += int64(n)
+	return n, nil
+}
+
+// finalizeTmp fsync 临时文件、关闭、atomic rename 为正式缓存路径。
+// 失败时调用方清理临时文件。
+func (c *nvmeCache) finalizeTmp(tmp *os.File, tmpPath, finalPath string) error {
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("fsync tmp: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close tmp: %w", err)
+	}
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		return fmt.Errorf("rename tmp to final: %w", err)
+	}
+	return nil
 }

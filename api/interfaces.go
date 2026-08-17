@@ -63,3 +63,16 @@ type CacheVerifier interface {
 	// 由调用方（如 FUSE 层后台 goroutine）周期性触发，不阻塞读路径。
 	Verify() VerifyResult
 }
+
+// ConcurrentPutter 是 DataCache 的可选能力：大文件多 block 并发拉取写入缓存
+// (PLAN §4.2)。用于缓存未命中大文件时，按 block 并发 GET Range，多个 goroutine
+// pwrite 到同一临时文件，全部完成后 atomic rename 为正式缓存文件 (INV-2 整文件缓存)。
+// FUSE 层通过接口断言使用（if cp, ok := dataCache.(ConcurrentPutter); ok { ... }），
+// 不强迫所有 DataCache 实现提供；不支持时调用方回退到 DataCache.Put。
+type ConcurrentPutter interface {
+	// PutConcurrent 并发拉取整对象并写入缓存，返回本地缓存文件路径。
+	// size 为对象总大小，concurrency 为并发 goroutine 数（<=0 时取默认 4），
+	// blockSize 为单 block 字节数（<=0 时取默认 4MB）。
+	// 任意 block 失败 → 整体失败，临时文件被清理，不污染索引（拉取中断不入库）。
+	PutConcurrent(ctx context.Context, key, etag string, size int64, store ObjectStore, concurrency, blockSize int64) (localPath string, err error)
+}
