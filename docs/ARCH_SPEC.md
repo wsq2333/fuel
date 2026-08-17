@@ -834,3 +834,4 @@ type Config struct {
 | self-build-route-evaluation.md | `design/self-build-route-evaluation.md` | 自建路线评估 |
 | go-alluxio-fuse-feasibility.md | `design/go-alluxio-fuse-feasibility.md` | Go Alluxio FUSE 可行性 |
 | alluxio_arch.md | `design/alluxio_arch.md` | 现有 Alluxio 架构 |
+| PAGE_STORE_DECISION.md | `docs/PAGE_STORE_DECISION.md` | PageStore vs 整文件缓存设计决策 |
