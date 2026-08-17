@@ -8,18 +8,21 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+
+	"fuel/internal/cache"
 )
 
 // fileHandle 是打开文件的句柄。
 // local 非空时持有缓存文件描述符（pread 零拷贝路径）；
 // local 为空时延迟到首次 Read 通过 singleflight 拉取缓存。
 type fileHandle struct {
-	node  *FuelNode
-	key   string
-	etag  string
-	size  int64
-	local *os.File
-	mu    sync.Mutex
+	node       *FuelNode
+	key        string
+	etag       string
+	size       int64
+	local      *os.File
+	prefetcher *cache.Prefetcher
+	mu         sync.Mutex
 }
 
 // newFileHandle 构造 fileHandle。localPath 非空时立即打开本地文件。
@@ -32,6 +35,18 @@ func newFileHandle(node *FuelNode, key, etag string, size int64, localPath strin
 		}
 		fh.local = f
 	}
+
+	// 初始化预读器（Phase 2）
+	cfg := node.root.cfg.Prefetch
+	fh.prefetcher = cache.NewPrefetcher(
+		key, size,
+		node.root.store,
+		node.root.dataCache,
+		cfg.Enabled,
+		cfg.Readahead.Initial,
+		cfg.Readahead.Max,
+	)
+
 	return fh, 0
 }
 
@@ -61,6 +76,12 @@ func (fh *fileHandle) read(ctx context.Context, dest []byte, off int64) (fuse.Re
 	if err != nil && n == 0 {
 		return nil, syscall.EIO
 	}
+
+	// 触发预读（Phase 2）
+	if fh.prefetcher != nil && n > 0 {
+		fh.prefetcher.OnRead(ctx, fh.etag, off, n)
+	}
+
 	return fuse.ReadResultData(dest[:n]), 0
 }
 
