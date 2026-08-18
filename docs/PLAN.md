@@ -414,7 +414,7 @@ Phase 6: 多后端扩展 (按需)                       按需
 
 ### Week 7: MySQL 元数据引擎
 
-#### 7.1 MySQL Engine
+#### 7.1 MySQL Engine ✅
 
 ```
 任务: 实现 MySQL MetadataEngine
