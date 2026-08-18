@@ -391,7 +391,7 @@ Phase 6: 多后端扩展 (按需)                       按需
 
 ### Week 6: Redis 元数据引擎
 
-#### 6.1 Redis Engine
+#### 6.1 Redis Engine ✅
 
 ```
 任务: 实现 Redis MetadataEngine

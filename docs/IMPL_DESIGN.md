@@ -286,12 +286,12 @@ type MetadataEngine interface {
 ```
 模式 A (direct): 无存储，每次直查 ObjectStore
 模式 B (Redis):
-    meta:{path}    → JSON(MetaEntry)    # 无过期，写路径主动删
-    dir:{dirPath}  → JSON([]DirEntry)   # 无过期，写路径主动删
-    neg:{path}     → "1"                # TTL 60s
+    meta:{bucket}/{path}    → JSON(MetaEntry)    # 无过期，写路径主动删
+    dir:{bucket}/{dirPath}  → JSON([]DirEntry)   # 无过期，写路径主动删
+    neg:{bucket}/{path}     → "1"                # TTL 60s
 模式 C (MySQL):
-    fuel_meta (path PK, size, etag, mtime, is_dir, content_type, updated_at)
-    fuel_dir  (dir_path, child_name, is_dir, size, etag, mtime)
+    fuel_meta     (bucket, path PK, size, etag, mtime, is_dir, content_type, mode, uid, gid, updated_at)
+    fuel_dentries (bucket, dir_path, child_name PK, is_dir, size, etag, mtime, content_type, updated_at)
 ```
 
 **工厂签名**: `MetadataEngineFactory = func(cfg *config.Config, store api.ObjectStore) (api.MetadataEngine, error)`。工厂除 `cfg` 外还接收 `store`——direct 模式直查对象存储、redis/mysql 健康检查失败时降级为 direct，都需要 `ObjectStore` 依赖。`NewMetadataEngine(cfg, store)` 按 `cfg.Metadata.Engine` 选择实现。
