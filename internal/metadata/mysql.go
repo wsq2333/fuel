@@ -3,11 +3,9 @@ package metadata
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"os"
 	"strings"
-	"syscall"
 	"time"
 
 	"fuel/api"
