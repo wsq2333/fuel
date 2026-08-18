@@ -78,8 +78,9 @@ func (p *Prefetcher) OnRead(ctx context.Context, etag string, offset int64, n in
 
 	readEnd := offset + int64(n)
 
-	// 顺序读检测：本次读的起始位置 ≈ 上次读的结束位置（允许小幅重叠）
-	isSequential := offset >= p.lastOffset-int64(n) && offset <= p.lastOffset+int64(n)
+	// 顺序读检测：本次读的起始位置在上次读结束位置附近（向前，允许小幅间隙）。
+	// 不把向后跳跃（seek backward）当作顺序读。
+	isSequential := offset >= p.lastOffset && offset <= p.lastOffset+int64(n)
 
 	if isSequential {
 		// 顺序读：倍增预读窗口
@@ -90,6 +91,8 @@ func (p *Prefetcher) OnRead(ctx context.Context, etag string, offset int64, n in
 				p.readaheadSize = p.maxReadahead
 			}
 		}
+
+		p.lastOffset = readEnd
 
 		// 触发异步预读：预读从 readEnd 开始的 readaheadSize 字节
 		nextOffset := readEnd
@@ -106,7 +109,8 @@ func (p *Prefetcher) OnRead(ctx context.Context, etag string, offset int64, n in
 			return
 		}
 
-		go p.doPrefetch(ctx, etag, nextOffset, prefetchEnd)
+		// 使用 context.Background()：预读是后台优化，不应受 FUSE 请求 context 取消影响。
+		go p.doPrefetch(context.Background(), etag, nextOffset, prefetchEnd)
 	} else {
 		// 乱序读：累计计数，超过阈值禁用预读
 		p.oooReadCount++
@@ -117,9 +121,8 @@ func (p *Prefetcher) OnRead(ctx context.Context, etag string, offset int64, n in
 			// 重置预读窗口为初始值
 			p.readaheadSize = p.initialReadahead
 		}
+		p.lastOffset = readEnd
 	}
-
-	p.lastOffset = readEnd
 }
 
 // doPrefetch 异步预读 [start, end) 范围的数据到缓存。
