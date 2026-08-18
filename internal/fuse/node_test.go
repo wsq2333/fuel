@@ -685,3 +685,85 @@ func TestFuelRoot_FillMissingMeta_AlreadyInline(t *testing.T) {
 		t.Error("ETag should be filled by fillMissingMeta (List API returns no ETag)")
 	}
 }
+
+// --- INV-9: 空 ETag 不得进入缓存身份链 ---
+
+// failingBatchEngine 模拟 BatchGetAttr 失败的引擎（fillMissingMeta 降级路径），
+// ListDir 返回的文件 Meta 停留为空 ETag。
+type failingBatchEngine struct {
+	*mockMetaEngine
+}
+
+func (m *failingBatchEngine) BatchGetAttr(ctx context.Context, paths []string) (map[string]*api.MetaEntry, error) {
+	return nil, errors.New("batch unavailable")
+}
+
+// TestFuelRoot_ListDirEntries_NoStatPrefillForEmptyETag 验证 fillMissingMeta 失败时，
+// 空 ETag 的文件 entry 不预填 stat 缓存（空身份会让 Open 的 ETag 校验失效，INV-9），
+// 后续 getAttr 回源拿到真实 ETag。
+func TestFuelRoot_ListDirEntries_NoStatPrefillForEmptyETag(t *testing.T) {
+	env := newTestEnv(t)
+	metaCache := cache.NewMetaCache(config.MetaCacheConfig{StatTTL: time.Minute, DirTTL: time.Minute})
+	root := NewFuelRoot(env.store, env.dataCache, metaCache, &failingBatchEngine{env.metaEng}, env.root.cfg)
+
+	env.addFile("d/f1", []byte("aaa"))
+
+	entries, errno := root.listDirEntries(env.ctx, "d")
+	if errno != 0 {
+		t.Fatalf("listDirEntries failed: %v", errno)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	if entries[0].Meta == nil || entries[0].Meta.ETag != "" {
+		t.Fatalf("precondition: entry Meta should exist with empty ETag, got %+v", entries[0].Meta)
+	}
+
+	if _, ok := metaCache.GetStat("d/f1"); ok {
+		t.Error("stat cache should not be prefilled for file entry with empty ETag (INV-9)")
+	}
+
+	me, errno := root.getAttr(env.ctx, "d/f1")
+	if errno != 0 || me == nil {
+		t.Fatalf("getAttr failed: %v", errno)
+	}
+	if me.ETag == "" {
+		t.Error("getAttr should fall back to engine and return real ETag")
+	}
+}
+
+// TestFuelRoot_BatchPrefetch_SkipEmptyETag 验证批量预取跳过无 ETag 的目标，
+// 正常目标仍被预取（INV-9：无身份不拉取入库）。
+func TestFuelRoot_BatchPrefetch_SkipEmptyETag(t *testing.T) {
+	env := newTestEnv(t)
+
+	dir := "data"
+	env.addFile(dir+"/f1", []byte("aaa"))
+	env.addFile(dir+"/f2", []byte("bbb"))
+	// f3 在引擎中有元数据但缺 ETag（降级路径残留），预取必须跳过
+	env.metaEng.entries[dir+"/f3"] = &api.MetaEntry{Path: dir + "/f3", Size: 3}
+	env.metaEng.dirs[dir] = []api.DirEntry{
+		{Name: "f1", Meta: &api.MetaEntry{Path: dir + "/f1", Size: 3}},
+		{Name: "f2", Meta: &api.MetaEntry{Path: dir + "/f2", Size: 3}},
+		{Name: "f3", Meta: &api.MetaEntry{Path: dir + "/f3", Size: 3}},
+	}
+
+	env.root.prefetchBatch(env.ctx, dir+"/f1")
+
+	// 等待 f2 预取完成（证明预取循环已执行）
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if env.dataCache.Contains(dir+"/f2", env.head(dir+"/f2").ETag) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !env.dataCache.Contains(dir+"/f2", env.head(dir+"/f2").ETag) {
+		t.Fatal("f2 should be prefetched into cache")
+	}
+	// f2 完成后循环已越过 f3，给跳过逻辑留出执行时间
+	time.Sleep(100 * time.Millisecond)
+	if got := env.dataCache.Stats().EntryCount; got != 1 {
+		t.Errorf("cache should contain only f2 (f3 skipped for empty ETag), got %d entries", got)
+	}
+}

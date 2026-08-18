@@ -163,11 +163,13 @@ func (r *FuelRoot) prefetchBatch(ctx context.Context, opened string) {
 		}
 		targets := cache.PrefetchAfter(dir, opened, entries, 0)
 		for _, key := range targets {
-			if _, hit, err := r.dataCache.Get(key, ""); err != nil || hit {
+			// 先取元数据（通常命中 listDirEntries 预填的 L1），拿到真实 ETag 再判存。
+			// 空 ETag 无法做身份校验（INV-9），跳过预取。
+			me, errno := r.getAttr(bgCtx, key)
+			if errno != 0 || me == nil || me.ETag == "" {
 				continue
 			}
-			me, errno := r.getAttr(bgCtx, key)
-			if errno != 0 || me == nil {
+			if r.dataCache.Contains(key, me.ETag) {
 				continue
 			}
 			if _, err := r.fetchAndCache(bgCtx, key, me.ETag, me.Size); err != nil {
@@ -263,10 +265,16 @@ func (r *FuelRoot) listDirEntries(ctx context.Context, dirPath string) ([]api.Di
 
 	r.metaCache.SetDir(dirPath, entries)
 	for i := range entries {
-		if entries[i].Meta != nil {
-			childPath := pathJoin(dirPath, entries[i].Name)
-			r.metaCache.SetStat(childPath, entries[i].Meta)
+		if entries[i].Meta == nil {
+			continue
 		}
+		// 文件缺 ETag（fillMissingMeta 失败的降级路径）不预填 stat 缓存：
+		// 空 ETag 会让 Open 的身份校验失效（INV-9），下次访问回源 HEAD 获取。
+		if !entries[i].IsDir && entries[i].Meta.ETag == "" {
+			continue
+		}
+		childPath := pathJoin(dirPath, entries[i].Name)
+		r.metaCache.SetStat(childPath, entries[i].Meta)
 	}
 	return entries, 0
 }

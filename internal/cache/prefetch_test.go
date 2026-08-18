@@ -388,6 +388,20 @@ func TestPutConcurrent_InvalidKey(t *testing.T) {
 	}
 }
 
+// TestPutConcurrent_EmptyETag 拒绝空 ETag 入库（INV-9：空身份条目后续无法校验）。
+func TestPutConcurrent_EmptyETag(t *testing.T) {
+	store := objectstore.NewMockStore("test")
+	c := newTestCache(t, 1<<20)
+	cp := asConcurrentPutter(t, c)
+
+	if _, err := cp.PutConcurrent(context.Background(), "f.txt", "", 100, store, 4, 4<<20); err == nil {
+		t.Error("PutConcurrent with empty etag should be rejected (INV-9)")
+	}
+	if c.Contains("f.txt", "") {
+		t.Error("empty-etag entry should not be indexed")
+	}
+}
+
 // TestPutConcurrent_GetFailureAborts 任意 block GET 失败 → 整体失败、临时文件清理、索引未污染。
 func TestPutConcurrent_GetFailureAborts(t *testing.T) {
 	store := &failingStore{

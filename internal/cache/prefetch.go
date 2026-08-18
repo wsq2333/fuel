@@ -69,12 +69,12 @@ func NewPrefetcher(
 // OnRead 在每次 Read 后调用，更新预读状态并触发预读。
 // offset 是本次读的起始位置，n 是读取的字节数。
 func (p *Prefetcher) OnRead(ctx context.Context, etag string, offset int64, n int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	if !p.enabled {
 		return
 	}
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
 
 	readEnd := offset + int64(n)
 
@@ -190,6 +190,9 @@ func (c *nvmeCache) PutConcurrent(
 ) (localPath string, err error) {
 	if !sanitizeKey(key) {
 		return "", fmt.Errorf("invalid cache key %q", key)
+	}
+	if etag == "" {
+		return "", fmt.Errorf("refuse to cache %s with empty etag: entry would be unverifiable (INV-9)", key)
 	}
 	if size <= 0 {
 		return "", fmt.Errorf("size must be positive, got %d", size)

@@ -86,6 +86,43 @@ func TestNVMeCache_ETagMismatch(t *testing.T) {
 	}
 }
 
+// TestNVMeCache_GetEmptyETag 空 ETag 无法证明身份（INV-9）→ miss，
+// 且不得按"ETag 不匹配"分支误删仍有效的条目。
+func TestNVMeCache_GetEmptyETag(t *testing.T) {
+	c := newTestCache(t, 1<<20)
+	path, err := c.Put("f.txt", "etag-real", 5, bytes.NewReader([]byte("hello")))
+	if err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	_, hit, err := c.Get("f.txt", "")
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if hit {
+		t.Error("expected miss for empty etag (unverifiable identity)")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Error("valid cache file should not be evicted by empty-etag Get")
+	}
+	if _, hit, _ := c.Get("f.txt", "etag-real"); !hit {
+		t.Error("expected hit with real etag after empty-etag Get")
+	}
+}
+
+// TestNVMeCache_PutEmptyETag 拒绝空 ETag 入库：空身份条目会让后续 Get 恒命中，
+// 身份校验永久失效（INV-9）。
+func TestNVMeCache_PutEmptyETag(t *testing.T) {
+	c := newTestCache(t, 1<<20)
+	_, err := c.Put("f.txt", "", 5, bytes.NewReader([]byte("hello")))
+	if err == nil {
+		t.Fatal("Put with empty etag should be rejected (INV-9)")
+	}
+	if c.Contains("f.txt", "") {
+		t.Error("empty-etag entry should not be indexed")
+	}
+}
+
 func TestNVMeCache_GetMissNoFile(t *testing.T) {
 	c := newTestCache(t, 1<<20)
 	_, hit, err := c.Get("nonexistent", "e")

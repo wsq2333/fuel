@@ -882,3 +882,56 @@ Phase 5 交付 (Week 11-13):
 | GOAL-6 可观测性 | Phase 4 | 监控指标 |
 | GOAL-7 故障降级 | Phase 4 | 故障恢复测试 |
 | GOAL-8 可维护性 | 全部 Phase | 接口隔离 + 测试 |
+
+---
+
+## 11. 已知不足与修复跟踪
+
+> 来源：2026-08 元数据缓存一致性审查（getAttr / listDirEntries / Open / prefetchBatch 链路）。
+> 状态标记：✅ 已修复 / 🔲 未决。未决项按优先级排序，修复时在此更新状态。
+
+### ✅ D1. 空 ETag 入库导致身份校验失效（INV-9 灰色路径）— 已修复
+
+- **根因链**: direct 引擎 `ListDir` 内联的 Meta 无 ETag → `fillMissingMeta`（BatchGetAttr）失败时静默跳过 → `listDirEntries` 仍将空 ETag 的 Meta 预填进 L1 stat 缓存 → `Open` 拿空 ETag 调 `dataCache.Get(key, "")` → `fetchAndCache` 以空 ETag `Put` 入库 → 后续 `Get(key, "")` 恒命中，**身份校验永久失效**（直到 stat TTL 过期自愈）。
+- **修复**:
+  - `listDirEntries`: 空 ETag 的**文件** entry 不预填 stat 缓存（目录无 ETag 需求），下次访问回源 HEAD（`node.go`）。
+  - `prefetchBatch`: 先 `getAttr` 取真实 ETag（通常命中预填的 L1），空 ETag 直接跳过；判存改用 `Contains`（`node.go`）。
+  - `DataCache.Get`: 空 ETag 一律 miss 且**不误删**已有条目（INV-9 不确定状态按 miss 处理）。
+  - `DataCache.Put` / `PutConcurrent`: 拒绝空 ETag 入库（防御纵深，空身份条目不可创建）。
+- **测试**: `TestNVMeCache_GetEmptyETag` / `TestNVMeCache_PutEmptyETag` / `TestPutConcurrent_EmptyETag` / `TestFuelRoot_ListDirEntries_NoStatPrefillForEmptyETag` / `TestFuelRoot_BatchPrefetch_SkipEmptyETag`。
+
+### ✅ D2. prefetchBatch 判存误删有效缓存条目 — 已修复（随 D1）
+
+- **现象**: `prefetchBatch` 用 `dataCache.Get(key, "")` 做存在性检查；条目带真实 ETag 时走"ETag 不匹配"分支，**删除有效缓存文件**后重新拉取，批量预取反而冲刷缓存。
+- **修复**: 判存改为 `Contains(key, me.ETag)`（不淘汰、不改 LRU），且 `Get` 空 ETag 不再触发淘汰分支（见 D1）。
+
+### ✅ D3. Prefetcher.OnRead 数据竞争 — 已修复（修复 D1 过程中 `-race` 发现，基线已存在）
+
+- **现象**: `OnRead` 在 `mu.Lock()` 之前读 `p.enabled`（prefetch.go:72），与锁内 `p.enabled = false`（乱序读禁用预读分支）竞争。
+- **修复**: `enabled` 检查移入锁内。`go test -race ./...` 全绿。
+
+### 🔲 D4. TTL 窗口内返回陈旧元数据/数据（内核 TTL 与 L1 TTL 叠加）
+
+- **现象**: 外部修改/删除 OSS 对象后，最长约 60s（内核 attr 30s + L1 stat 30s 叠加）内 `getAttr` 返回旧 Meta；窗口内 `Open` 用旧 ETag 命中旧数据缓存，ETag 校验链不启动（§7.3 身份校验只在 L1/L2 miss 回源 HEAD 后执行）。外部新建对象最长约 90s（内核 negative 30s + L1 neg 60s）返回 ENOENT。
+- **定位**: 这是 §7.1 明确的最终一致设计（业务前提：一次写多次读、无外部修改）。若"外部修改 OSS"成为真实场景则不可接受。
+- **处置建议**: 确认业务无外部修改则保持现状；否则评估缩短 TTL、open 强制 HEAD（牺牲性能）、或 L2 失效主动推送。
+
+### 🔲 D5. neg 缓存与 dir 缓存不一致：`ls` 可见但 `open` ENOENT
+
+- **现象**: stat 不存在路径 → neg 缓存 60s；期间外部创建该文件 → dir 缓存 10s 过期后 `ls` 可见，但 `getAttr` 命中 neg 仍返回 ENOENT（最长再持续 ~50s）。三层缓存 TTL 独立、`listDirEntries` 不查 neg。
+- **处置建议**: 接受（训练数据集极少边读边建），或令 negTTL ≤ dirTTL，或 `listDirEntries` 回源后对出现的子项主动 `DeleteNeg`。
+
+### 🔲 D6. 写路径主动失效未实现
+
+- **现象**: FUSE 层当前只读（`Open` 非 O_RDONLY 返回 ENOTSUP），`metaCache.InvalidatePrefix` 在 FUSE 层零调用，L1 一致性纯靠 TTL。
+- **处置**: Phase 3 Week 8 写路径落地时，Flush/Unlink/Rename/Mkdir/Rmdir 必须按 §7.2 顺序调用 `metaCache.InvalidatePrefix` + `metaEng.Invalidate` + `dataCache.Remove`，并补写后读一致性测试（8.2）。
+
+### 🔲 D7. 大文件（> maxFileSize）读取直接 EIO
+
+- **现象**: `Put`/`PutConcurrent` 对超限文件返回"不缓存"错误，但 `fetchAndCache` 上层无直透降级，`Read` 直接返回 EIO —— 超过 maxFileSize（默认 1GB）的文件**不可读**（点云/视频大文件在业务范围内）。
+- **处置建议**: 实现大文件直读降级（不缓存，Range GET 直透应用），或将 maxFileSize 语义改为硬上限并在配置校验时告警。
+
+### 🔲 D8. `fillEntryOut`/`fillAttrOut` 中 `SetTimeout(0)` 为误导性空操作
+
+- **现象**: 代码看似要关闭内核缓存，实际 go-fuse bridge 在超时为 0 时套用 `fs.Options` 默认值（EntryTimeout=dirTTL / AttrTimeout=statTTL / NegativeTimeout=attrTTL），行为正确但代码误导。
+- **处置建议**: 删除无效调用或改注释说明"继承 Options 默认 TTL"。

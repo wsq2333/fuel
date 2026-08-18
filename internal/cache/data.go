@@ -71,9 +71,15 @@ func (c *nvmeCache) localPath(key string) string {
 }
 
 // Get 查找缓存。命中返回本地文件路径并更新 LRU；ETag 不匹配则删除缓存并返回 miss。
+// etag 为空表示调用方无法提供身份证明（INV-9 不确定状态）：直接返回 miss，
+// 且不按"ETag 不匹配"分支误删可能仍有效的条目。
 func (c *nvmeCache) Get(key, etag string) (localPath string, hit bool, err error) {
 	if !sanitizeKey(key) {
 		return "", false, fmt.Errorf("invalid cache key %q", key)
+	}
+	if etag == "" {
+		c.misses.Add(1)
+		return "", false, nil
 	}
 	entry, ok := c.index.get(key)
 	if !ok {
@@ -105,6 +111,9 @@ func (c *nvmeCache) Get(key, etag string) (localPath string, hit bool, err error
 func (c *nvmeCache) Put(key, etag string, size int64, r io.Reader) (localPath string, err error) {
 	if !sanitizeKey(key) {
 		return "", fmt.Errorf("invalid cache key %q", key)
+	}
+	if etag == "" {
+		return "", fmt.Errorf("refuse to cache %s with empty etag: entry would be unverifiable (INV-9)", key)
 	}
 	if c.maxFileSize > 0 && size > c.maxFileSize {
 		return "", fmt.Errorf("file %s size %d exceeds maxFileSize %d, skip caching", key, size, c.maxFileSize)
