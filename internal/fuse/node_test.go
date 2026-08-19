@@ -156,6 +156,11 @@ type testEnv struct {
 }
 
 func newTestEnv(t *testing.T) *testEnv {
+	return newTestEnvWithMetaCache(t, config.MetaCacheConfig{})
+}
+
+// newTestEnvWithMetaCache 构造测试环境并指定 L1 缓存配置（TTL<=0 表示该层关闭）。
+func newTestEnvWithMetaCache(t *testing.T, mc config.MetaCacheConfig) *testEnv {
 	t.Helper()
 
 	store := objectstore.NewMockStore("test-bucket")
@@ -168,11 +173,7 @@ func newTestEnv(t *testing.T) *testEnv {
 		},
 		Metadata: config.MetadataConfig{
 			Engine: "direct",
-			Cache: config.MetaCacheConfig{
-				StatTTL: 0,
-				DirTTL:  0,
-				NegTTL:  0,
-			},
+			Cache:  mc,
 		},
 		Cache: config.CacheConfig{
 			Dir:       t.TempDir(),

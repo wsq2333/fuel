@@ -438,57 +438,73 @@ Phase 6: 多后端扩展 (按需)                       按需
 
 ### Week 8: 写路径 + 一致性验证
 
-#### 8.1 写路径实现
+#### 8.1 写路径实现 ✅
 
 ```
 任务: 实现 FUSE 写路径
 文件:
   internal/fuse/ops.go             ← 写操作实现
+  internal/fuse/handle.go          ← fileHandle 写状态 + flush
 新增操作:
-  Create(path)     → 创建 FileHandle (dirty=true)
-  Write(fd, data)  → 写本地临时文件
-  Flush(fd)        → 临时文件 PutObject → 失效 L1 + L2 + 数据缓存
+  Create(path)     → 创建 FileHandle (tmp 写句柄)
+  Write(fd, data)  → 写本地临时文件 (tmp.WriteAt)
+  Flush(fd)        → 临时文件 PutObject → 失效 L1 + L2 + 数据缓存 → SetStat 新元数据 → 尽力回写数据缓存
   Fsync(fd)        → 同 Flush
+  Open(O_WRONLY|O_TRUNC) → 整文件覆盖写
   Unlink(path)     → ObjectStore.Delete → 失效缓存
-  Rename(old, new) → ObjectStore.Copy + Delete → 失效两端缓存
-  Mkdir(dir)       → ObjectStore.Put 零字节占位对象
-  Rmdir(dir)       → ObjectStore.Delete 占位对象
+  Rename(old, new) → ObjectStore.Copy + Delete → 失效两端缓存 (仅文件; 目录 ENOTSUP)
+  Mkdir(dir)       → ObjectStore.Put 零字节占位对象 → SetStat 目录元数据
+  Rmdir(dir)       → 非空检查 → ObjectStore.Delete 占位对象
 验证:
-  写文件 → 立即读 → 读到最新数据
-  写文件 → 跨节点读 → 读到最新数据 (L2 引擎共享)
-  删除文件 → 读 → ENOENT
-  go test ./internal/fuse/... 通过
+  写文件 → 立即读 → 读到最新数据 ✅
+  写文件 → 跨节点读 → 读到最新数据 (L2 引擎共享) ✅
+  删除文件 → 读 → ENOENT ✅
+  go test ./internal/fuse/... 通过 ✅
+实现说明 (2026-08):
+  写语义: 一次写多次读。O_RDWR / O_APPEND / 无 O_TRUNC 的原地写 → ENOTSUP；
+  Flush 后再 Write → ENOTSUP。写临时文件落 {cache.dir}/{bucket}/.fuel-write-*，
+  崩溃残留由 NewNVMeCache 启动时 cleanOrphanTemps 清理。
+  失效顺序 (ARCH_SPEC §7.2): L1(DeleteStat/DeleteNeg/InvalidatePrefix/DeleteDir父目录)
+  → L2(metaEng.Invalidate，失败降级靠 TTL) → 数据缓存(Remove，失败靠 ETag 不匹配自愈)。
+  L2/数据缓存失效失败不掩盖写成功（INV-1 真相来源在对象存储）。
 ```
 
-#### 8.2 写后读一致性验证
+#### 8.2 写后读一致性验证 ✅
 
 ```
 任务: 端到端写后读一致性测试
 文件:
   internal/fuse/write_test.go    ← 写后读一致性测试
 测试场景:
-  场景 1: 写文件 → 同节点立即读 → 读到新数据
-  场景 2: 写文件 → 同节点 L1 TTL 过期后读 → 读到新数据
-  场景 3: 写文件 → 跨节点读 (模式 B Redis) → 读到新数据
-  场景 4: 覆盖写 → 缓存失效 → 读到新数据
-  场景 5: 删除 → 读到 ENOENT
-  场景 6: rename → 旧路径 ENOENT, 新路径可读
-  场景 7: mkdir → readdir 可见
-  场景 8: rmdir → readdir 不可见
+  场景 1: 写文件 → 同节点立即读 → 读到新数据 ✅ (+ INV-3 字节镜像断言)
+  场景 2: 写文件 → 同节点 L1 TTL 过期后读 → 读到新数据 ✅ (与场景 4 合并)
+  场景 3: 写文件 → 跨节点读 (模式 B Redis, miniredis) → 读到新数据 ✅
+  场景 4: 覆盖写 → 缓存失效 → 读到新数据 ✅
+  场景 5: 删除 → 读到 ENOENT ✅
+  场景 6: rename → 旧路径 ENOENT, 新路径可读 ✅
+  场景 7: mkdir → readdir 可见 ✅
+  场景 8: rmdir → readdir 不可见 ✅
+  边界: 零字节文件 / Flush 后写 ENOTSUP / 无 O_TRUNC 覆盖 ENOTSUP /
+       O_TRUNC Open 覆盖 / Unlink 目录 EISDIR / Rmdir 非空 ENOTEMPTY /
+       Rename 源缺失 ENOENT / Fsync 等价 Flush ✅
 验证标准 (ARCH_SPEC.md §7):
-  单节点写后读: 强一致
-  跨节点写后读: 最终一致 (L1 TTL 过期后)
+  单节点写后读: 强一致 ✅
+  跨节点写后读: 最终一致 (L1 TTL 过期后) ✅
 ```
 
-#### 8.3 元数据引擎模式切换验证
+#### 8.3 元数据引擎模式切换验证 ✅
 
 ```
 任务: 验证三种模式可切换
+文件:
+  internal/fuse/mode_test.go     ← 模式切换测试
 测试:
-  模式 A (direct) → 模式 B (redis) → 模式 C (mysql) 切换
-  切换后 FUSE 行为一致
-  切换后数据不变
-  元数据引擎不可用时自动降级
+  模式 A (direct) → 模式 B (redis) 切换后 FUSE 写读删行为一致 ✅
+    (TestModeSwitch_DirectRedis_IdenticalBehavior)
+  元数据引擎不可用时自动降级直查 ✅
+    (TestModeSwitch_RedisDown_DegradesToDirect)
+  模式 C (mysql): 引擎契约由 internal/metadata 的 sqlmock 测试覆盖
+    (工厂不支持注入 *sql.DB，FUSE 层行为经统一接口归纳成立)
 ```
 
 ### Phase 3 交付物清单
@@ -921,10 +937,10 @@ Phase 5 交付 (Week 11-13):
 - **现象**: stat 不存在路径 → neg 缓存 60s；期间外部创建该文件 → dir 缓存 10s 过期后 `ls` 可见，但 `getAttr` 命中 neg 仍返回 ENOENT（最长再持续 ~50s）。三层缓存 TTL 独立、`listDirEntries` 不查 neg。
 - **处置建议**: 接受（训练数据集极少边读边建），或令 negTTL ≤ dirTTL，或 `listDirEntries` 回源后对出现的子项主动 `DeleteNeg`。
 
-### 🔲 D6. 写路径主动失效未实现
+### ✅ D6. 写路径主动失效未实现 — 已修复（Week 8）
 
-- **现象**: FUSE 层当前只读（`Open` 非 O_RDONLY 返回 ENOTSUP），`metaCache.InvalidatePrefix` 在 FUSE 层零调用，L1 一致性纯靠 TTL。
-- **处置**: Phase 3 Week 8 写路径落地时，Flush/Unlink/Rename/Mkdir/Rmdir 必须按 §7.2 顺序调用 `metaCache.InvalidatePrefix` + `metaEng.Invalidate` + `dataCache.Remove`，并补写后读一致性测试（8.2）。
+- 写路径（Flush/Unlink/Rename/Mkdir/Rmdir）统一经 `invalidateAfterWrite` 按 §7.2 顺序失效 L1 + L2 + 数据缓存（`ops.go`）。写后读一致性 8 场景测试落地（`write_test.go`）。
+- 残留限制：目录 Rename 不支持（需递归拷贝前缀下全部对象，超出 MVP）→ 见 D9。
 
 ### 🔲 D7. 大文件（> maxFileSize）读取直接 EIO
 
@@ -935,3 +951,13 @@ Phase 5 交付 (Week 11-13):
 
 - **现象**: 代码看似要关闭内核缓存，实际 go-fuse bridge 在超时为 0 时套用 `fs.Options` 默认值（EntryTimeout=dirTTL / AttrTimeout=statTTL / NegativeTimeout=attrTTL），行为正确但代码误导。
 - **处置建议**: 删除无效调用或改注释说明"继承 Options 默认 TTL"。
+
+### 🔲 D9. 目录 Rename 不支持（Week 8 引入的已知限制）
+
+- **现象**: `Rename` 对目录返回 ENOTSUP——对象存储无目录实体，目录 rename 需递归 Copy+Delete 前缀下全部对象，代价高且非原子，超出 MVP。
+- **处置建议**: 若业务需要，按前缀批量 Copy + Delete 实现（接受非原子），或保持 ENOTSUP。
+
+### 🔲 D10. Redis 不可用时降级直查有显著延迟（Week 8 测试发现）
+
+- **现象**: Redis 连接失败时，每次元数据操作需等待 go-redis 重试耗尽（连接池 5 次 dial × MaxRetries=3，约 1s/次）才 fallback 直查对象存储。降级功能正确（INV-4）但延迟不可接受。
+- **处置建议**: Phase 4 监控落地后，用 `HealthCheck` 周期探测 + 熔断器模式：Redis 不健康时引擎直接走 direct 路径，跳过无效重试；恢复后自动切回。

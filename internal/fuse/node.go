@@ -335,9 +335,15 @@ func dirStreamFrom(entries []api.DirEntry) fs.DirStream {
 
 // --- 文件打开与读取 ---
 
-// Open 打开文件。只读模式检查元数据并尝试命中数据缓存；写模式返回 ENOTSUP。
+// Open 打开文件。只读模式检查元数据并尝试命中数据缓存；
+// O_WRONLY|O_TRUNC 为整文件覆盖写（一次写语义，见 ops.go）；
+// 其余写模式（O_RDWR / O_APPEND / 无 O_TRUNC 的原地写）返回 ENOTSUP。
 func (n *FuelNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
 	if flags&syscall.O_ACCMODE != syscall.O_RDONLY {
+		if flags&syscall.O_ACCMODE == syscall.O_WRONLY &&
+			flags&syscall.O_TRUNC != 0 && flags&syscall.O_APPEND == 0 {
+			return n.openForWrite(ctx)
+		}
 		return nil, 0, syscall.ENOTSUP
 	}
 
@@ -372,6 +378,23 @@ func (n *FuelNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint3
 	return fh, fuse.FOPEN_KEEP_CACHE, 0
 }
 
+// openForWrite 以整文件覆盖语义打开已有对象（O_CREAT 路径由 Create 处理）。
+func (n *FuelNode) openForWrite(ctx context.Context) (fs.FileHandle, uint32, syscall.Errno) {
+	me, errno := n.root.getAttr(ctx, n.path)
+	if errno != 0 {
+		return nil, 0, errno
+	}
+	if me.IsDir {
+		return nil, 0, syscall.EISDIR
+	}
+	tmp, err := n.root.newWriteTmp()
+	if err != nil {
+		return nil, 0, syscall.EIO
+	}
+	n.root.metaCache.DeleteNeg(n.path)
+	return &fileHandle{node: n, key: n.path, tmp: tmp}, 0, 0
+}
+
 // parentDir 返回对象 key 的父目录（无 "/" 时为 ""）。
 func parentDir(key string) string {
 	i := strings.LastIndex(key, "/")
@@ -396,9 +419,23 @@ var (
 	_ fs.NodeLookuper  = (*FuelRoot)(nil)
 	_ fs.NodeGetattrer = (*FuelRoot)(nil)
 	_ fs.NodeReaddirer = (*FuelRoot)(nil)
+	_ fs.NodeCreater   = (*FuelRoot)(nil)
+	_ fs.NodeMkdirer   = (*FuelRoot)(nil)
+	_ fs.NodeUnlinker  = (*FuelRoot)(nil)
+	_ fs.NodeRmdirer   = (*FuelRoot)(nil)
+	_ fs.NodeRenamer   = (*FuelRoot)(nil)
+
 	_ fs.NodeLookuper  = (*FuelNode)(nil)
 	_ fs.NodeGetattrer = (*FuelNode)(nil)
 	_ fs.NodeReaddirer = (*FuelNode)(nil)
 	_ fs.NodeOpener    = (*FuelNode)(nil)
 	_ fs.NodeReader    = (*FuelNode)(nil)
+	_ fs.NodeCreater   = (*FuelNode)(nil)
+	_ fs.NodeWriter    = (*FuelNode)(nil)
+	_ fs.NodeFlusher   = (*FuelNode)(nil)
+	_ fs.NodeFsyncer   = (*FuelNode)(nil)
+	_ fs.NodeMkdirer   = (*FuelNode)(nil)
+	_ fs.NodeUnlinker  = (*FuelNode)(nil)
+	_ fs.NodeRmdirer   = (*FuelNode)(nil)
+	_ fs.NodeRenamer   = (*FuelNode)(nil)
 )
