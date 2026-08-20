@@ -1,0 +1,52 @@
+# Fuel 配置（对应 internal/config 结构体，ARCH_SPEC §8）。
+# 修改后：kubectl apply -f deploy/k8s/configmap.yaml && kubectl rollout restart ds/fuel
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fuel-config
+  namespace: fuel-system
+data:
+  config.yaml: |
+    # 对象存储后端（INV-8）：oss | s3 | minio（后两者 Phase 6）
+    storage:
+      type: oss
+      bucket: eabot-train-prod
+      oss:
+        endpoint: oss-cn-beijing.aliyuncs.com
+
+    # 元数据引擎（INV-4）：direct | redis | mysql。
+    # direct = 直查对象存储（无外部依赖，优先保证可用性）；
+    # redis/mysql 由部署方按需切换到集群内已有服务，并同步修改 address/dsn。
+    metadata:
+      engine: direct
+      redis:
+        address: ""
+      mysql:
+        dsn: ""
+      cache:                      # L1 内存缓存 TTL（单节点强一致窗口）
+        statTTL: 30s
+        dirTTL: 10s
+        negTTL: 60s
+
+    # NVMe 数据缓存（INV-2: {cacheDir}/{bucket}/{key} 字节镜像）
+    cache:
+      dir: /mnt/nvme/fuel
+      capacity: 1800000000000     # 1.8TB，按节点 NVMe 实际容量调整
+      highWatermark: 0.85
+      lowWatermark: 0.70
+      maxFileSize: 1073741824     # >1GB 文件暂不缓存（见 PLAN §11 D7）
+      verifyInterval: 0s          # 0 = 关闭内容巡检
+
+    # FUSE 挂载（INV-5：独立于编排层运行）
+    fuse:
+      mountPoint: /fuel
+      maxRead: 1048576
+      options:
+        - large_read
+        - kernel_cache
+        - auto_cache
+
+    # 监控（PLAN §9.1）：DaemonSet 探针与 Prometheus 抓取均使用该端点
+    monitor:
+      metricsAddr: ":49999"
+      logLevel: info

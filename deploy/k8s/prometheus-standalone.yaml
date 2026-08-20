@@ -1,0 +1,122 @@
+# 可选：standalone Prometheus（仅开发/测试，集群已有 Prometheus 时不要部署）。
+#
+# 用途：在没有 prometheus-operator / 存量 Prometheus 的环境里快速验证
+# "curl /metrics → Prometheus 抓取" 链路（PLAN §10.2 验证项）。
+# 非生产形态：单副本、无持久化、无 HA。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fuel-prometheus
+  namespace: fuel-system
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+    scrape_configs:
+    - job_name: fuel
+      kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names: [fuel-system]
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: "true"
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+        target_label: __address__
+---
+# Prometheus 需要读取本 namespace 的 Pod 列表（kubernetes_sd role: pod）。
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fuel-prometheus
+  namespace: fuel-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: fuel-prometheus
+  namespace: fuel-system
+rules:
+- apiGroups: [""]
+  resources: [pods, endpoints, services]
+  verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fuel-prometheus
+  namespace: fuel-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: fuel-prometheus
+subjects:
+- kind: ServiceAccount
+  name: fuel-prometheus
+  namespace: fuel-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fuel-prometheus
+  namespace: fuel-system
+  labels:
+    app: fuel-prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fuel-prometheus
+  template:
+    metadata:
+      labels:
+        app: fuel-prometheus
+    spec:
+      serviceAccountName: fuel-prometheus
+      containers:
+      - name: prometheus
+        image: prom/prometheus:v2.53.0
+        args:
+        - --config.file=/etc/prometheus/prometheus.yml
+        - --storage.tsdb.retention.time=24h
+        ports:
+        - name: web
+          containerPort: 9090
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: "1"
+            memory: 1Gi
+        volumeMounts:
+        - name: config
+          mountPath: /etc/prometheus
+          readOnly: true
+      volumes:
+      - name: config
+        configMap:
+          name: fuel-prometheus
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fuel-prometheus
+  namespace: fuel-system
+spec:
+  selector:
+    app: fuel-prometheus
+  ports:
+  - name: web
+    port: 9090
+    targetPort: web
+  # 集群内访问；本地调试可 kubectl port-forward svc/fuel-prometheus 9090:9090

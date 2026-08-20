@@ -1,0 +1,73 @@
+# Fuel 指标抓取配置（Prometheus 不随 Fuel 部署——见 docs/PLAN.md §10.2 说明）。
+#
+# 方式 A（推荐）：集群已有 prometheus-operator 时，应用 ServiceMonitor；
+# 方式 B：vanilla Prometheus 时，按文件末尾注释中的 scrape_configs 片段配置；
+# 方式 C（仅开发/测试，无集群级 Prometheus）：kubectl apply -f prometheus-standalone.yaml。
+#
+# Fuel Pod 已带注解 prometheus.io/scrape|port|path（daemonset.yaml），
+# 方式 B 的 kubernetes_sd_configs 会自动发现，无需 Service。
+
+# headless Service：DaemonSet 指标按 Pod 抓取，不需要负载均衡/固定 IP。
+apiVersion: v1
+kind: Service
+metadata:
+  name: fuel-metrics
+  namespace: fuel-system
+  labels:
+    app: fuel
+spec:
+  clusterIP: None
+  selector:
+    app: fuel
+  ports:
+  - name: metrics
+    port: 49999
+    targetPort: metrics
+---
+# 方式 A：prometheus-operator 的 ServiceMonitor。
+# 要求集群已安装 monitoring.coreos.com/v1 CRD（kube-prometheus-stack 自带）。
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: fuel
+  namespace: fuel-system
+  labels:
+    app: fuel
+spec:
+  selector:
+    matchLabels:
+      app: fuel
+  namespaceSelector:
+    matchNames:
+    - fuel-system
+  endpoints:
+  - port: metrics
+    path: /metrics
+    interval: 15s
+    scrapeTimeout: 10s
+
+# 方式 B：vanilla Prometheus 的 scrape_configs 片段（追加到 prometheus.yml）：
+#
+#   - job_name: fuel
+#     kubernetes_sd_configs:
+#     - role: pod
+#       namespaces:
+#         names: [fuel-system]
+#     relabel_configs:
+#     - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+#       action: keep
+#       regex: "true"
+#     - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+#       action: replace
+#       target_label: __metrics_path__
+#       regex: (.+)
+#     - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+#       action: replace
+#       regex: ([^:]+)(?::\d+)?;(\d+)
+#       replacement: $1:$2
+#       target_label: __address__
+#
+# /health（依赖状态，非探活）可接入告警，例如 PrometheusRule:
+#   - alert: FuelMetadataEngineDown
+#     expr: up{job="fuel"} == 0
+#     for: 1m

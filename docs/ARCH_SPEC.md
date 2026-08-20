@@ -630,9 +630,13 @@ fuel_process_goroutine_count                    # goroutine 数
 ### 9.2 健康检查
 
 ```
-GET /health → 200 OK (进程健康) / 503 (元数据引擎不可达等)
+GET /health → 200 OK (依赖健康) / 503 (元数据引擎不可达等)   # 供监控告警
+GET /livez  → 200 OK (进程存活，不检查依赖)                  # 供 K8s liveness/readiness 探针
 GET /metrics → Prometheus 格式指标
 ```
+
+> 探针必须用 `/livez`：`/health` 在依赖（Redis/OSS）不可用时返回 503，
+> 用于 liveness 会触发 kubelet 重启容器 → FUSE 挂载中断，放大故障（INV-4 要求降级而非重启）。
 
 ---
 

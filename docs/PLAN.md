@@ -595,19 +595,40 @@ Phase 6: 多后端扩展 (按需)                       按需
   systemctl status fuel → 运行状态正常
 ```
 
-#### 10.2 K8s DaemonSet 部署
+#### 10.2 K8s DaemonSet 部署 ⏳（YAML 清单已交付，集群验证待做）
 
 ```
 任务: K8s DaemonSet YAML + ConfigMap + Secret
 文件:
-  deploy/k8s/daemonset.yaml        ← Fuel FUSE DaemonSet
-  deploy/k8s/configmap.yaml       ← 配置
-  deploy/k8s/secret.yaml          ← 凭证 (CI 注入)
+  deploy/Dockerfile                     ← 镜像构建（scratch + 静态二进制，无 CGO）✅
+  deploy/k8s/daemonset.yaml             ← Fuel FUSE DaemonSet ✅
+    (privileged + /dev/fuse hostPath + /fuel Bidirectional 传播 + NVMe hostPath
+     + metrics 端口 49999 + prometheus.io/* Pod 注解 + /livez 探针)
+  deploy/k8s/configmap.yaml             ← 配置 ✅（内嵌 fuel-config.yaml 经
+    TestDeployConfigMap_EmbeddedConfigLoads 静态契约测试）
+  deploy/k8s/secret.yaml                ← 凭证模板（kubectl create secret 注入）✅
+  deploy/k8s/monitoring.yaml            ← metrics headless Service + ServiceMonitor ✅
+  deploy/k8s/prometheus-standalone.yaml ← 可选 standalone（无集群级 Prometheus 时）✅
+
+Prometheus 部署拓扑（2026-08 决策）:
+  Prometheus 是独立组件，不随 Fuel 部署（pull 模型抓取 :49999/metrics）。
+  生产上复用集群级 Prometheus（prometheus-operator 用 ServiceMonitor；
+  vanilla 用 monitoring.yaml 注释中的 kubernetes_sd pod 注解发现）；
+  集群没有 Prometheus 时用 prometheus-standalone.yaml（仅开发/测试）。
+  Fuel 侧只需保证 /metrics 暴露 + Pod 注解/Service 标签约定。
+
+探针设计修正（原 "livenessProbe /health 通过"）:
+  liveness/readiness 改用 /livez（进程存活即 200）。/health 在依赖
+  （Redis/OSS）不可用时返回 503，用于 liveness 会触发 kubelet 重启容器
+  → FUSE 挂载中断放大故障（违反 INV-4 降级语义）。/health 保留给告警。
+  ARCH_SPEC §9.2 已同步更新。
+
 验证:
-  kubectl apply -f deploy/k8s/ → DaemonSet 正常启动
-  FUSE 挂载点可用
-  Prometheus 抓取指标正常
-  livenessProbe /health 通过
+  kubectl apply -f deploy/k8s/ → DaemonSet 正常启动   🔲（需真实集群 + 构建镜像）
+  FUSE 挂载点可用                                       🔲
+  Prometheus 抓取指标正常                                🔲
+  livenessProbe /livez 通过                              🔲
+  YAML 语法 + ConfigMap 内嵌配置可解析                     ✅（Go 测试 + yaml 解析校验）
 ```
 
 #### 10.3 故障恢复测试
@@ -648,8 +669,10 @@ Phase 6: 多后端扩展 (按需)                       按需
 文件:
   internal/monitor/metrics.go / http.go / metrics_test.go / http_test.go  ✅
     (health 端点并入 http.go; log.go 属 9.2 日志体系待做)
+  deploy/Dockerfile ✅
+  deploy/k8s/daemonset.yaml / configmap.yaml / secret.yaml ✅
+  deploy/k8s/monitoring.yaml / prometheus-standalone.yaml ✅
   deploy/systemd/fuel.service
-  deploy/k8s/daemonset.yaml / configmap.yaml / secret.yaml
   internal/fuse/failure_test.go
   internal/cache/index.go (BoltDB 持久化, 可选)
 
@@ -970,3 +993,13 @@ Phase 5 交付 (Week 11-13):
 
 - **现象**: `fuel_meta_hit_total{layer="l2"}` 指标缺失——Redis/MySQL 引擎内部缓存未插桩，无法统计 L2 命中；当前只暴露 `layer="l1"`。
 - **处置建议**: 引擎 GetAttr/ListDir 命中分支计数（引擎内部 atomic 计数器 + scrape 读取），或接受 L1 命中作为元数据热路径代表。
+
+### ✅ D12. 探针不能用 /health（依赖不可用会放大故障）— 已修复（Week 9/10）
+
+- **现象**: 原设计（PLAN 10.2）livenessProbe 指向 /health；/health 在 Redis/OSS 不可用时返回 503 → kubelet 重启容器 → FUSE 挂载中断，依赖故障被放大为数据面故障（违反 INV-4 降级语义）。
+- **修复**: monitor.Server 增加 `/livez`（进程存活即 200，不检查依赖）；DaemonSet liveness/readiness 均用 `/livez`；`/health` 保留依赖语义供监控告警。ARCH_SPEC §9.2 已同步。
+
+### 🔲 D13. DaemonSet 镜像构建流水线未建立
+
+- **现象**: `deploy/k8s/daemonset.yaml` 引用 `registry.example.com/fuel:latest` 占位镜像；`deploy/Dockerfile` 已提供（scratch + 静态二进制），但 CI 构建/推送流程未建立。
+- **处置建议**: Phase 4 落地时在 CI 中加 `CGO_ENABLED=0 go build` + `docker build -f deploy/Dockerfile` 步骤。

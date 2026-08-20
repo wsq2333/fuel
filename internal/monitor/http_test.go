@@ -87,6 +87,26 @@ func TestServer_HealthTimeout(t *testing.T) {
 	}
 }
 
+// TestServer_Livez /livez 进程存活即 200，与依赖健康无关（供 K8s 探针）。
+func TestServer_Livez(t *testing.T) {
+	s := NewServer("127.0.0.1:0", func(ctx context.Context) error {
+		return errors.New("dependency down") // /health 失败不影响 /livez
+	})
+	if err := s.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer func() { _ = s.Stop() }()
+
+	resp, err := http.Get("http://" + s.Addr() + "/livez")
+	if err != nil {
+		t.Fatalf("GET /livez failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200 even when dependency down", resp.StatusCode)
+	}
+}
+
 // TestServer_Metrics /metrics 暴露 fuel_ 前缀指标（promauto 注册到默认注册表）。
 func TestServer_Metrics(t *testing.T) {
 	// 触发各类指标，确保其 family 出现在 /metrics 文本中

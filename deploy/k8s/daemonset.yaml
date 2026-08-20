@@ -1,0 +1,115 @@
+# Fuel FUSE DaemonSet（PLAN §10.2，ARCH_SPEC §10.2 DaemonSet 模式）。
+#
+# 拓扑：每个 GPU 训练节点一个 Fuel Pod，在宿主机 /fuel/{bucket} 建立 FUSE 挂载点；
+# 应用 Pod 通过 hostPath + mountPropagation: HostToContainer 共享该挂载点（不跑 FUSE、不需要 privileged）。
+#
+# 前置条件：
+#   - 节点可访问 /dev/fuse；容器需要 privileged（或 CAP_SYS_ADMIN），ARCH_SPEC §10.2
+#   - NVMe 缓存目录已挂到节点 /mnt/nvme/fuel
+#   - 镜像需先构建（deploy/Dockerfile）并推送到 registry.example.com/fuel:latest
+#
+# 探针说明（PLAN §11 D12）：liveness/readiness 用 /livez（进程存活即 200）。
+# 不可以用 /health（依赖不可用时返回 503，会触发 kubelet 重启，导致 FUSE 挂载中断放大故障）；
+# /health 保留给监控告警（如 Prometheus Rule）。
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fuel-system
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fuel
+  namespace: fuel-system
+  labels:
+    app: fuel
+spec:
+  selector:
+    matchLabels:
+      app: fuel
+  template:
+    metadata:
+      labels:
+        app: fuel
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "49999"
+        prometheus.io/path: "/metrics"
+    spec:
+      # 仅调度到 GPU 训练节点（按集群实际配置，示例）：
+      # nodeSelector:
+      #   accelerator: nvidia
+      # tolerations:
+      # - key: nvidia.com/gpu
+      #   operator: Exists
+      #   effect: NoSchedule
+      containers:
+      - name: fuel
+        image: registry.example.com/fuel:latest   # 替换为实际镜像
+        imagePullPolicy: IfNotPresent
+        command: ["/fuel", "mount", "--config", "/etc/fuel/config.yaml"]
+        securityContext:
+          privileged: true                        # /dev/fuse + mount(2) 需要（ARCH_SPEC §10.2）
+        ports:
+        - name: metrics
+          containerPort: 49999
+        env:
+        - name: OSS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: fuel-oss
+              key: accessKey
+        - name: OSS_ACCESS_KEY_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: fuel-oss
+              key: accessSecret
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: "2"
+            memory: 4Gi
+        livenessProbe:
+          httpGet:
+            path: /livez
+            port: metrics
+          initialDelaySeconds: 10
+          periodSeconds: 15
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /livez
+            port: metrics
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 5
+        volumeMounts:
+        - name: fuel-config
+          mountPath: /etc/fuel
+          readOnly: true
+        - name: fuse-dev
+          mountPath: /dev/fuse
+        - name: mountpoint
+          # FUSE 挂载点传播到宿主机，应用 Pod 通过 hostPath 共享（PLAN §M4）
+          mountPath: /fuel
+          mountPropagation: Bidirectional
+        - name: cache
+          mountPath: /mnt/nvme/fuel
+      volumes:
+      - name: fuel-config
+        configMap:
+          name: fuel-config
+      - name: fuse-dev
+        hostPath:
+          path: /dev/fuse
+      - name: mountpoint
+        hostPath:
+          path: /fuel
+          type: DirectoryOrCreate
+      - name: cache
+        hostPath:
+          path: /mnt/nvme/fuel
+          type: DirectoryOrCreate
