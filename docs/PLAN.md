@@ -534,31 +534,34 @@ Phase 6: 多后端扩展 (按需)                       按需
 
 ### Week 9: 监控 + 日志 + 健康检查
 
-#### 9.1 Prometheus 指标
+#### 9.1 Prometheus 指标 ✅
 
 ```
 任务: 实现全部监控指标
 文件:
-  internal/monitor/metrics.go      ← 指标定义 + 采集
-  internal/monitor/health.go       ← 健康检查端点
+  internal/monitor/metrics.go      ← 指标定义 + FuelCollector 采集 + InstrumentStore 装饰器
+  internal/monitor/http.go         ← /metrics + /health HTTP 端点
+  internal/monitor/metrics_test.go / http_test.go
 指标 (ARCH_SPEC.md §9.1):
-  fuel_cache_hit_total{type="data"}
-  fuel_cache_miss_total{type="data"}
-  fuel_cache_size_bytes / fuel_cache_capacity_bytes
-  fuel_cache_eviction_total
-  fuel_meta_hit_total{layer="l1/l2"} / fuel_meta_miss_total
-  fuel_neg_cache_hit_total
-  fuel_storage_requests_total{backend,operation}
-  fuel_storage_request_duration_seconds{backend,operation}
-  fuel_fuse_read_duration_seconds
-  fuel_fuse_operations_total{op}
-  fuel_prefetch_total / fuel_prefetch_bytes_total
-  fuel_process_memory_bytes / fuel_process_goroutine_count
+  fuel_cache_hit_total{type="data"} / fuel_cache_miss_total{type="data"}  ✅ (FuelCollector 读 DataCache.Stats)
+  fuel_cache_size_bytes / fuel_cache_capacity_bytes / fuel_cache_eviction_total / fuel_cache_entries  ✅
+  fuel_meta_hit_total{layer="l1"} / fuel_meta_miss_total / fuel_neg_cache_hit_total  ✅ (MetaCache.Stats; L2 命中无计数 → §11 D11)
+  fuel_storage_requests_total{operation} / fuel_storage_request_duration_seconds{operation}  ✅
+    (InstrumentStore 装饰器，INV-8 后端中立; ARCH_SPEC 的 oss_ 前缀改为 storage_，多后端时再加 backend label)
+  fuel_fuse_read_duration_seconds / fuel_fuse_operations_total{op}  ✅ (FUSE 层 IncFuseOp/ObserveFuseRead)
+  fuel_prefetch_total / fuel_prefetch_bytes_total  ✅ (批量预取粒度，fuse 层上报)
+  fuel_process_memory_bytes / fuel_process_goroutine_count  ✅ (runtime.MemStats/NumGoroutine)
 健康检查:
-  GET /health → 200 OK / 503 (元数据引擎不可达)
+  GET /health → 200 OK / 503 (checker 失败，3s 超时兜底)  ✅
+  GET /metrics → promhttp 默认注册表  ✅
+挂载接线 (cmd/fuel/mount.go):
+  store 经 monitor.InstrumentStore 包装；FuelCollector 注册默认注册表；
+  monitor.Server 以 metaEng.HealthCheck 为 checker 启动；
+  监控端口绑定失败仅 WARN 不阻塞挂载（观测性组件降级不影响数据面）；
+  卸载后 mon.Stop + metaEng.Close。
 验证:
-  curl localhost:49999/metrics 返回全部指标
-  curl localhost:49999/health 返回 200
+  curl localhost:49999/metrics 返回全部指标 ✅ (TestServer_Metrics)
+  curl localhost:49999/health 返回 200 / 503 ✅ (TestServer_Health*)
 ```
 
 #### 9.2 日志体系
@@ -643,7 +646,8 @@ Phase 6: 多后端扩展 (按需)                       按需
 
 ```
 文件:
-  internal/monitor/metrics.go / health.go / log.go
+  internal/monitor/metrics.go / http.go / metrics_test.go / http_test.go  ✅
+    (health 端点并入 http.go; log.go 属 9.2 日志体系待做)
   deploy/systemd/fuel.service
   deploy/k8s/daemonset.yaml / configmap.yaml / secret.yaml
   internal/fuse/failure_test.go
@@ -961,3 +965,8 @@ Phase 5 交付 (Week 11-13):
 
 - **现象**: Redis 连接失败时，每次元数据操作需等待 go-redis 重试耗尽（连接池 5 次 dial × MaxRetries=3，约 1s/次）才 fallback 直查对象存储。降级功能正确（INV-4）但延迟不可接受。
 - **处置建议**: Phase 4 监控落地后，用 `HealthCheck` 周期探测 + 熔断器模式：Redis 不健康时引擎直接走 direct 路径，跳过无效重试；恢复后自动切回。
+
+### 🔲 D11. L2 元数据引擎无命中计数器
+
+- **现象**: `fuel_meta_hit_total{layer="l2"}` 指标缺失——Redis/MySQL 引擎内部缓存未插桩，无法统计 L2 命中；当前只暴露 `layer="l1"`。
+- **处置建议**: 引擎 GetAttr/ListDir 命中分支计数（引擎内部 atomic 计数器 + scrape 读取），或接受 L1 命中作为元数据热路径代表。

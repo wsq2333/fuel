@@ -5,6 +5,7 @@ import (
 	"os"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -12,6 +13,7 @@ import (
 
 	"fuel/api"
 	"fuel/internal/cache"
+	"fuel/internal/monitor"
 )
 
 // fileHandle 是打开文件的句柄。
@@ -60,6 +62,9 @@ func newFileHandle(node *FuelNode, key, etag string, size int64, localPath strin
 
 // read 实现读逻辑（IMPL_DESIGN §6.1 / §6.2）。
 func (fh *fileHandle) read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+	start := time.Now()
+	defer func() { monitor.ObserveFuseRead(time.Since(start)) }()
+
 	fh.mu.Lock()
 	if fh.local == nil {
 		localPath, err := fh.node.root.fetchAndCache(ctx, fh.key, fh.etag, fh.size)

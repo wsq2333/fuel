@@ -14,6 +14,7 @@ import (
 	"go.uber.org/zap"
 
 	"fuel/api"
+	"fuel/internal/monitor"
 )
 
 // 写路径实现 (PLAN §8.1, IMPL_DESIGN §6.3)。
@@ -59,6 +60,7 @@ func (r *FuelRoot) invalidateAfterWrite(ctx context.Context, path string) {
 // create 创建文件并返回写句柄（数据暂存临时文件，Flush 时整文件上传）。
 // 目标已存在时要求 O_TRUNC（整文件覆盖写），否则拒绝原地修改。
 func (r *FuelRoot) create(ctx context.Context, parent *fs.Inode, parentPath, name string, flags, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
+	monitor.IncFuseOp("create")
 	if flags&syscall.O_ACCMODE == syscall.O_RDWR || flags&syscall.O_APPEND != 0 {
 		return nil, nil, 0, syscall.ENOTSUP
 	}
@@ -111,6 +113,7 @@ func (n *FuelNode) Create(ctx context.Context, name string, flags uint32, mode u
 }
 
 func (n *FuelNode) Write(ctx context.Context, f fs.FileHandle, data []byte, off int64) (uint32, syscall.Errno) {
+	monitor.IncFuseOp("write")
 	fh, ok := f.(*fileHandle)
 	if !ok || fh == nil {
 		return 0, syscall.EIO
@@ -119,6 +122,7 @@ func (n *FuelNode) Write(ctx context.Context, f fs.FileHandle, data []byte, off 
 }
 
 func (n *FuelNode) Flush(ctx context.Context, f fs.FileHandle) syscall.Errno {
+	monitor.IncFuseOp("flush")
 	fh, ok := f.(*fileHandle)
 	if !ok || fh == nil {
 		return syscall.EIO
@@ -128,6 +132,7 @@ func (n *FuelNode) Flush(ctx context.Context, f fs.FileHandle) syscall.Errno {
 
 // Fsync 同 Flush（对象存储无 fsync 语义，IMPL_DESIGN §5.3）。
 func (n *FuelNode) Fsync(ctx context.Context, f fs.FileHandle, flags uint32) syscall.Errno {
+	monitor.IncFuseOp("fsync")
 	fh, ok := f.(*fileHandle)
 	if !ok || fh == nil {
 		return syscall.EIO
@@ -138,6 +143,7 @@ func (n *FuelNode) Fsync(ctx context.Context, f fs.FileHandle, flags uint32) sys
 // --- Unlink ---
 
 func (r *FuelRoot) unlink(ctx context.Context, parentPath, name string) syscall.Errno {
+	monitor.IncFuseOp("unlink")
 	key := pathJoin(parentPath, name)
 	me, errno := r.getAttr(ctx, key)
 	if errno != 0 {
@@ -168,6 +174,7 @@ func (n *FuelNode) Unlink(ctx context.Context, name string) syscall.Errno {
 // 仅支持文件：目录 rename 需要递归拷贝前缀下全部对象，超出 MVP（PLAN §11 D9）。
 // RENAME_NOREPLACE / RENAME_EXCHANGE 等 flags 不支持。
 func (r *FuelRoot) rename(ctx context.Context, oldParent, name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
+	monitor.IncFuseOp("rename")
 	if flags != 0 {
 		return syscall.ENOTSUP
 	}
@@ -221,6 +228,7 @@ func (n *FuelNode) Rename(ctx context.Context, name string, newParent fs.InodeEm
 
 // mkdir 上传零字节占位对象 key+"/"（IMPL_DESIGN §5.3），并失效父目录列表缓存。
 func (r *FuelRoot) mkdir(ctx context.Context, parent *fs.Inode, parentPath, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	monitor.IncFuseOp("mkdir")
 	key := pathJoin(parentPath, name)
 	switch _, errno := r.getAttr(ctx, key); errno {
 	case 0:
@@ -261,6 +269,7 @@ func (n *FuelNode) Mkdir(ctx context.Context, name string, mode uint32, out *fus
 // rmdir 删除占位对象。POSIX 语义要求目录为空：key+"/" 前缀下
 // 除占位对象自身外存在任何子项 → ENOTEMPTY。
 func (r *FuelRoot) rmdir(ctx context.Context, parentPath, name string) syscall.Errno {
+	monitor.IncFuseOp("rmdir")
 	key := pathJoin(parentPath, name)
 	marker := key + "/"
 

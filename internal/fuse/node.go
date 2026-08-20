@@ -14,6 +14,7 @@ import (
 	"fuel/api"
 	"fuel/internal/cache"
 	"fuel/internal/config"
+	"fuel/internal/monitor"
 )
 
 // FuelRoot 是挂载点根节点，持有所有依赖 (IMPL_DESIGN §5.2)。
@@ -162,6 +163,8 @@ func (r *FuelRoot) prefetchBatch(ctx context.Context, opened string) {
 			return
 		}
 		targets := cache.PrefetchAfter(dir, opened, entries, 0)
+		fetched := 0
+		var fetchedBytes int64
 		for _, key := range targets {
 			// 先取元数据（通常命中 listDirEntries 预填的 L1），拿到真实 ETag 再判存。
 			// 空 ETag 无法做身份校验（INV-9），跳过预取。
@@ -175,7 +178,10 @@ func (r *FuelRoot) prefetchBatch(ctx context.Context, opened string) {
 			if _, err := r.fetchAndCache(bgCtx, key, me.ETag, me.Size); err != nil {
 				continue
 			}
+			fetched++
+			fetchedBytes += me.Size
 		}
+		monitor.ObserveBatchPrefetch(fetched, fetchedBytes)
 	}()
 }
 
@@ -183,6 +189,7 @@ func (r *FuelRoot) prefetchBatch(ctx context.Context, opened string) {
 
 // Lookup 查找根目录下的直接子项。
 func (r *FuelRoot) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	monitor.IncFuseOp("lookup")
 	childPath := name
 	me, errno := r.getAttr(ctx, childPath)
 	if errno != 0 {
@@ -196,6 +203,7 @@ func (r *FuelRoot) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 
 // Getattr 返回根目录属性。
 func (r *FuelRoot) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	monitor.IncFuseOp("getattr")
 	me := api.DirMetaEntry("/", r.uid, r.gid)
 	fillAttrOut(me, out)
 	return 0
@@ -203,6 +211,7 @@ func (r *FuelRoot) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrO
 
 // Readdir 列出根目录（bucket 根前缀）。
 func (r *FuelRoot) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+	monitor.IncFuseOp("readdir")
 	return r.listDir(ctx, "")
 }
 
@@ -210,6 +219,7 @@ func (r *FuelRoot) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 
 // Lookup 查找当前目录下的子项。
 func (n *FuelNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	monitor.IncFuseOp("lookup")
 	childPath := pathJoin(n.path, name)
 	me, errno := n.root.getAttr(ctx, childPath)
 	if errno != 0 {
@@ -223,6 +233,7 @@ func (n *FuelNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 
 // Getattr 返回当前节点属性。
 func (n *FuelNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	monitor.IncFuseOp("getattr")
 	me, errno := n.root.getAttr(ctx, n.path)
 	if errno != 0 {
 		return errno
@@ -233,6 +244,7 @@ func (n *FuelNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrO
 
 // Readdir 列出当前目录。
 func (n *FuelNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+	monitor.IncFuseOp("readdir")
 	return n.root.listDir(ctx, n.path)
 }
 
@@ -339,6 +351,7 @@ func dirStreamFrom(entries []api.DirEntry) fs.DirStream {
 // O_WRONLY|O_TRUNC 为整文件覆盖写（一次写语义，见 ops.go）；
 // 其余写模式（O_RDWR / O_APPEND / 无 O_TRUNC 的原地写）返回 ENOTSUP。
 func (n *FuelNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+	monitor.IncFuseOp("open")
 	if flags&syscall.O_ACCMODE != syscall.O_RDONLY {
 		if flags&syscall.O_ACCMODE == syscall.O_WRONLY &&
 			flags&syscall.O_TRUNC != 0 && flags&syscall.O_APPEND == 0 {
@@ -406,6 +419,7 @@ func parentDir(key string) string {
 
 // Read 从文件读取数据。缓存命中时 pread 本地文件；未命中时 singleflight 拉取后 pread。
 func (n *FuelNode) Read(ctx context.Context, f fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+	monitor.IncFuseOp("read")
 	fh, ok := f.(*fileHandle)
 	if !ok || fh == nil {
 		return nil, syscall.EIO
