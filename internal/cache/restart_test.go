@@ -124,3 +124,51 @@ func TestCleanOrphanTemps_OnlyTemps(t *testing.T) {
 		t.Errorf(".fuelx should be kept (not matching prefix .fuel-), stat err=%v", err)
 	}
 }
+
+// TestScanRebuild_OnRestart 模拟进程重启：存量缓存文件被扫描登记进索引，
+// 空间恢复记账（参与 LRU 淘汰）；ETag 未知的条目 Get 必然 miss（INV-9：
+// 不返回无法证明正确的数据），miss 后剔除，重新 Put 后恢复命中。
+func TestScanRebuild_OnRestart(t *testing.T) {
+	dir := t.TempDir()
+
+	// 第一次运行：写入两个缓存文件
+	c1 := newCacheAt(t, dir)
+	if _, err := c1.Put("train/f1.jpg", "etag1", 5, bytes.NewReader([]byte("hello"))); err != nil {
+		t.Fatalf("Put f1: %v", err)
+	}
+	if _, err := c1.Put("train/f2.jpg", "etag2", 6, bytes.NewReader([]byte("world!"))); err != nil {
+		t.Fatalf("Put f2: %v", err)
+	}
+
+	// 崩溃 → 同目录重新构造（触发扫描重建）
+	c2 := newCacheAt(t, dir)
+
+	// 空间记账恢复：两个文件的字节数计入 used
+	stats := c2.Stats()
+	if stats.EntryCount != 2 {
+		t.Errorf("rebuilt entry count = %d, want 2", stats.EntryCount)
+	}
+	if stats.UsedBytes != 11 {
+		t.Errorf("rebuilt used bytes = %d, want 11", stats.UsedBytes)
+	}
+
+	// ETag 未知 → Get miss（INV-9：不可证明正确不返回），且条目被剔除
+	if _, hit, err := c2.Get("train/f1.jpg", "etag1"); err != nil || hit {
+		t.Errorf("Get rebuilt entry = hit %v err %v, want miss (unknown etag)", hit, err)
+	}
+	if _, err := os.Stat(c2.localPath("train/f1.jpg")); !os.IsNotExist(err) {
+		t.Error("unverifiable rebuilt file should be removed on miss")
+	}
+
+	// miss 后回源重拉（Put）→ 恢复正常命中
+	if _, err := c2.Put("train/f1.jpg", "etag1", 5, bytes.NewReader([]byte("hello"))); err != nil {
+		t.Fatalf("re-Put: %v", err)
+	}
+	if _, hit, _ := c2.Get("train/f1.jpg", "etag1"); !hit {
+		t.Error("Get after re-Put should hit")
+	}
+	// f2 未被访问，仍登记在索引中（可被淘汰，不泄漏）
+	if !c2.Contains("train/f2.jpg", "") {
+		t.Error("untouched rebuilt entry should remain in index")
+	}
+}

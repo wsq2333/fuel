@@ -1,0 +1,40 @@
+# Fuel systemd 单元（ARCH_SPEC §10.1 / PLAN §10.1）
+#
+# 安装：
+#   sudo cp fuel /usr/local/bin/fuel
+#   sudo mkdir -p /etc/fuel /mnt/nvme/fuel
+#   sudo cp fuel-config.yaml /etc/fuel/config.yaml   # 见 deploy/k8s/configmap.yaml 内容
+#   sudo cp deploy/systemd/fuel.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now fuel
+#
+# 验证：
+#   systemctl status fuel                    # active (running)
+#   ls /fuel/{bucket}                        # 挂载点可用
+#   systemctl restart fuel                   # 缓存索引扫描重建（PLAN §10.1），进程由 Restart=always 兜底
+[Unit]
+Description=Fuel POSIX cache filesystem for object storage
+# 元数据引擎为 redis/mysql 时按部署追加 After=redis.service 等依赖
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/fuel mount --config /etc/fuel/config.yaml
+Restart=always
+RestartSec=2
+# 优雅退出：SIGINT → Flush 未上传数据 → Unmount
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+# FUSE 需要 /dev/fuse 与 mount(2) 权限（privileged 二进制由部署方决定，勿复用普通账号的 CapabilityBoundingSet）
+# 资源限制示例（按节点规格调整）：
+# MemoryMax=4G
+# CPUQuota=200%
+
+# 日志走 stderr（Journald 收集）
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

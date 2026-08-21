@@ -2,8 +2,10 @@ package fuse
 
 import (
 	"context"
+	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -33,6 +35,11 @@ type fileHandle struct {
 	// 写路径状态。tmp 非空表示写句柄且尚未上传；Flush 成功后置 nil。
 	tmp     *os.File
 	written int64
+
+	// degraded 置位后读路径跳过缓存拉取，直接 readThrough（缓存写失败降级）。
+	// degradedWarn 用于降级日志只打一次（避免持续降级期间 WARN 刷屏）。
+	degraded     atomic.Bool
+	degradedWarn atomic.Bool
 }
 
 // newFileHandle 构造 fileHandle。localPath 非空时立即打开本地文件。
@@ -66,27 +73,39 @@ func (fh *fileHandle) read(ctx context.Context, dest []byte, off int64) (fuse.Re
 	defer func() { monitor.ObserveFuseRead(time.Since(start)) }()
 
 	fh.mu.Lock()
-	if fh.local == nil {
+	if fh.local == nil && !fh.degraded.Load() {
 		zap.L().Debug("read cache miss, fetching", zap.String("key", fh.key), zap.Int64("off", off))
-		localPath, err := fh.node.root.fetchAndCache(ctx, fh.key, fh.etag, fh.size)
-		if err != nil {
-			fh.mu.Unlock()
-			zap.L().Error("read: fetch from object store failed", zap.String("key", fh.key), zap.Error(err))
-			return nil, syscall.EIO
+		localPath, ferr := fh.node.root.fetchAndCache(ctx, fh.key, fh.etag, fh.size)
+		if ferr == nil {
+			f, oerr := os.Open(localPath)
+			if oerr != nil {
+				zap.L().Error("read: open cached file failed", zap.String("key", fh.key), zap.String("path", localPath), zap.Error(oerr))
+				ferr = oerr
+			} else {
+				fh.local = f
+			}
 		}
-		f, err := os.Open(localPath)
-		if err != nil {
+		if fh.local == nil {
+			// 缓存拉取失败（磁盘满 ENOSPC / 超过 maxFileSize / 写缓存拒绝）：
+			// 降级 Range 直读对象存储，不写缓存（GOAL-7 仅性能降级）。
+			// 置 degraded，本句柄后续读不再尝试写缓存（避免每次读都重复拉整文件）。
+			fh.degraded.Store(true)
 			fh.mu.Unlock()
-			zap.L().Error("read: open cached file failed", zap.String("key", fh.key), zap.String("path", localPath), zap.Error(err))
-			return nil, syscall.EIO
+			if fh.degradedWarn.CompareAndSwap(false, true) {
+				zap.L().Warn("read degraded to read-through (cache unavailable)", zap.String("key", fh.key), zap.Error(ferr))
+			}
+			return fh.readThrough(ctx, dest, off)
 		}
-		fh.local = f
-	} else {
-		zap.L().Debug("read cache hit", zap.String("key", fh.key), zap.Int64("off", off), zap.Int("len", len(dest)))
 	}
 	local := fh.local
 	fh.mu.Unlock()
 
+	if local == nil {
+		// 降级句柄：不再尝试缓存，直接 Range 直读
+		return fh.readThrough(ctx, dest, off)
+	}
+
+	zap.L().Debug("read cache hit", zap.String("key", fh.key), zap.Int64("off", off), zap.Int("len", len(dest)))
 	if off >= fh.size {
 		return fuse.ReadResultData(nil), 0
 	}
@@ -100,6 +119,32 @@ func (fh *fileHandle) read(ctx context.Context, dest []byte, off int64) (fuse.Re
 		fh.prefetcher.OnRead(ctx, fh.etag, off, n)
 	}
 
+	return fuse.ReadResultData(dest[:n]), 0
+}
+
+// readThrough 缓存不可用时的降级读：Range GET 直接从对象存储读取本次请求区间，
+// 不写缓存。数据来自真相来源（OSS），无需身份校验（INV-9 回源路径）。
+// 触发场景：磁盘空间不足、文件超过 maxFileSize、缓存目录不可写等。
+func (fh *fileHandle) readThrough(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+	if off >= fh.size {
+		return fuse.ReadResultData(nil), 0
+	}
+	length := int64(len(dest))
+	if remain := fh.size - off; length > remain {
+		length = remain
+	}
+	reader, err := fh.node.root.store.Get(ctx, fh.key, off, length)
+	if err != nil {
+		zap.L().Error("readThrough: range get failed", zap.String("key", fh.key), zap.Int64("off", off), zap.Int64("len", length), zap.Error(err))
+		return nil, syscall.EIO
+	}
+	defer func() { _ = reader.Close() }()
+
+	n, err := io.ReadFull(reader, dest[:length])
+	if err != nil && n == 0 {
+		return nil, syscall.EIO
+	}
+	zap.L().Debug("readThrough served", zap.String("key", fh.key), zap.Int64("off", off), zap.Int("n", n))
 	return fuse.ReadResultData(dest[:n]), 0
 }
 

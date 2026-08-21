@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	_ "github.com/go-sql-driver/mysql" // 注册 database/sql 的 mysql 驱动
 	"go.uber.org/zap"
 
 	"fuel/api"

@@ -62,7 +62,48 @@ func NewNVMeCache(dir, bucket string, capacity int64, highWatermark, lowWatermar
 		index:              newCacheIndex(),
 	}
 	c.cleanOrphanTemps()
+	c.scanRebuild()
 	return c, nil
+}
+
+// scanRebuild 启动时扫描缓存根目录，将存量文件登记进索引（ETag 未知）。
+// 进程重启后内存索引为空而磁盘文件仍在：不登记则这些文件既不命中也不参与
+// LRU 淘汰，永久泄漏空间。登记后恢复空间记账与淘汰能力（PLAN §10.1 扫描重建）。
+// ETag 未知的条目无法证明身份（INV-9）：Get 必然 mismatch → miss 回源重拉，
+// 绝不返回不可验证的陈旧数据。真正热恢复（含 ETag）见 PLAN §10.4 索引持久化。
+func (c *nvmeCache) scanRebuild() int {
+	root := filepath.Join(c.dir, c.bucket)
+	count := 0
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		// 残留临时文件已由 cleanOrphanTemps 清理；此处防御性跳过
+		if strings.HasPrefix(d.Name(), tmpFilePrefix) {
+			return nil
+		}
+		info, ierr := d.Info()
+		if ierr != nil {
+			return nil
+		}
+		rel, rerr := filepath.Rel(root, path)
+		if rerr != nil || strings.HasPrefix(rel, "..") {
+			return nil
+		}
+		key := filepath.ToSlash(rel)
+		if !sanitizeKey(key) {
+			return nil
+		}
+		c.index.put(&cacheEntry{
+			Key:       key,
+			ETag:      "", // 身份未知：Get 必然 miss 回源（INV-9）
+			Size:      info.Size(),
+			LocalPath: path,
+		})
+		count++
+		return nil
+	})
+	return count
 }
 
 // localPath 返回 key 对应的缓存文件路径 {dir}/{bucket}/{key}。

@@ -594,16 +594,24 @@ Phase 6: 多后端扩展 (按需)                       按需
 
 ### Week 10: systemd + K8s DaemonSet + 故障恢复测试
 
-#### 10.1 systemd 服务
+#### 10.1 systemd 服务 ✅（YAML 交付 + 静态契约测试；真机部署验证待做）
 
 ```
 任务: systemd unit 文件 + 安装脚本
 文件:
-  deploy/systemd/fuel.service      ← systemd unit
+  deploy/systemd/fuel.service      ← systemd unit（Restart=always, SIGINT 优雅退出, Journald 日志）✅
 验证:
-  systemctl start fuel → 挂载成功
-  systemctl restart fuel → 缓存索引重建 (MVP: 扫描重建)
-  systemctl status fuel → 运行状态正常
+  systemctl start fuel → 挂载成功                              🔲（需真机）
+  systemctl restart fuel → 缓存索引重建 (MVP: 扫描重建)          ✅（TestScanRebuild_OnRestart /
+                                                                  TestFailure_Restart_IndexRebuild）
+  systemctl status fuel → 运行状态正常                          🔲（需真机）
+  unit 文件关键字段（ExecStart/Restart/KillSignal）              ✅（TestDeploy_SystemdServiceContract）
+
+扫描重建语义（INV-9 约束下的 MVP 实现）:
+  重启后 NewNVMeCache 扫描 {dir}/{bucket}，存量文件以 ETag="" 登记索引：
+  - 恢复空间记账与 LRU 淘汰能力（修复重启后磁盘文件永久泄漏）
+  - ETag 未知 → Get 必然 miss 回源（INV-9：无法证明正确不返回），重拉后恢复命中
+  - 真正热恢复（含 ETag）见 10.4 BoltDB 索引持久化（可选）
 ```
 
 #### 10.2 K8s DaemonSet 部署 ⏳（YAML 清单已交付，集群验证待做）
@@ -642,23 +650,28 @@ Prometheus 部署拓扑（2026-08 决策）:
   YAML 语法 + ConfigMap 内嵌配置可解析                     ✅（Go 测试 + yaml 解析校验）
 ```
 
-#### 10.3 故障恢复测试
+#### 10.3 故障恢复测试 ✅（单元级；集群级故障注入待做）
 
 ```
 任务: 端到端故障恢复测试
 文件:
-  internal/fuse/failure_test.go    ← 故障恢复测试
+  internal/fuse/failure_test.go    ← 故障恢复测试 ✅
 测试场景 (ARCH_SPEC.md §GOAL-7):
-  场景 1: FUSE 进程崩溃 → systemd/K8s 自动重启 → 缓存索引重建
-  场景 2: 元数据引擎 (Redis) 宕机 → L1 缓存可用 → 降级为直查对象存储
-  场景 3: 元数据引擎 (MySQL) 宕机 → 同上
-  场景 4: 对象存储网络不可达 → 已缓存数据正常读 → 未缓存返回 EIO
-  场景 5: 磁盘空间不足 → LRU 淘汰 → 降级为不缓存
-  场景 6: 缓存索引持久化恢复 (BoltDB, 如果 Phase 4 实现)
+  场景 1: FUSE 进程崩溃 → 重启 → 缓存索引扫描重建   ✅ TestFailure_Restart_IndexRebuild
+  场景 2: Redis 宕机 → L1 缓存可用 → 降级直查       ✅ TestFailure_RedisDown_L1WarmRead
+  场景 3: MySQL 宕机 → 同上                        ✅ TestFailure_MySQLDown_DegradeToDirect
+          （顺带发现并修复：生产代码从未注册 mysql 驱动，sql.Open("mysql") 必失败——
+           此前引擎测试全走 sqlmock 未暴露；已加 `_ "github.com/go-sql-driver/mysql"`）
+  场景 4: 对象存储网络不可达 → 已缓存正常读 / 未缓存 EIO  ✅ TestFailure_StoreDown_*
+  场景 5: 磁盘空间不足/缓存拒绝写入 → 降级 readThrough 直读 ✅ TestFailure_CacheRejected_ReadThrough
+          （顺带修复 D7：>maxFileSize 文件此前直接 EIO，现在降级直读可用）
+          读路径新增 readThrough：缓存拉取失败时 Range GET 直读对象存储，不写缓存；
+          degraded 粘性标记避免重复整文件拉取。
+  场景 6: 缓存索引持久化恢复 (BoltDB, 10.4 可选)   🔲 未实现，跳过
 验证标准:
-  所有场景下功能正常 (仅性能降级)
-  无 panic, 无数据丢失
-  监控告警触发正常
+  所有场景下功能正常 (仅性能降级) ✅（单测全绿，-race 通过）
+  无 panic, 无数据丢失 ✅
+  监控告警触发正常 🔲（需 Prometheus 告警规则，接 /health 与指标阈值）
 ```
 
 #### 10.4 缓存索引持久化 (可选)
@@ -683,9 +696,10 @@ Prometheus 部署拓扑（2026-08 决策）:
   deploy/Dockerfile ✅
   deploy/k8s/daemonset.yaml / configmap.yaml / secret.yaml ✅
   deploy/k8s/monitoring.yaml / prometheus-standalone.yaml ✅
-  deploy/systemd/fuel.service
-  internal/fuse/failure_test.go
-  internal/cache/index.go (BoltDB 持久化, 可选)
+  deploy/systemd/fuel.service ✅
+  internal/fuse/failure_test.go ✅（10.3 场景 1-5 单元级全绿）
+  internal/config/deploy_config_test.go ✅（K8s/systemd 清单与代码的静态契约测试）
+  internal/cache/index.go (BoltDB 持久化, 可选) 🔲 未实现（10.4 可选项）
 
 验证:
   Prometheus 指标齐全
@@ -980,10 +994,11 @@ Phase 5 交付 (Week 11-13):
 - 写路径（Flush/Unlink/Rename/Mkdir/Rmdir）统一经 `invalidateAfterWrite` 按 §7.2 顺序失效 L1 + L2 + 数据缓存（`ops.go`）。写后读一致性 8 场景测试落地（`write_test.go`）。
 - 残留限制：目录 Rename 不支持（需递归拷贝前缀下全部对象，超出 MVP）→ 见 D9。
 
-### 🔲 D7. 大文件（> maxFileSize）读取直接 EIO
+### ✅ D7. 大文件（> maxFileSize）读取直接 EIO — 已修复（Week 10.3）
 
-- **现象**: `Put`/`PutConcurrent` 对超限文件返回"不缓存"错误，但 `fetchAndCache` 上层无直透降级，`Read` 直接返回 EIO —— 超过 maxFileSize（默认 1GB）的文件**不可读**（点云/视频大文件在业务范围内）。
-- **处置建议**: 实现大文件直读降级（不缓存，Range GET 直透应用），或将 maxFileSize 语义改为硬上限并在配置校验时告警。
+- 读路径新增 `readThrough` 降级（`handle.go`）：`fetchAndCache` 失败（ENOSPC / 超 maxFileSize / 缓存写拒绝）时 Range GET 直读对象存储，不写缓存；`degraded` 粘性标记避免本句柄重复整文件拉取。
+- 数据直读来自真相来源（OSS），不违反 INV-9。
+- 测试：`TestFailure_CacheRejected_ReadThrough`（多区间读 + 不缓存断言）。
 
 ### 🔲 D8. `fillEntryOut`/`fillAttrOut` 中 `SetTimeout(0)` 为误导性空操作
 
@@ -1014,3 +1029,8 @@ Phase 5 交付 (Week 11-13):
 
 - **现象**: `deploy/k8s/daemonset.yaml` 引用 `registry.example.com/fuel:latest` 占位镜像；`deploy/Dockerfile` 已提供（scratch + 静态二进制），但 CI 构建/推送流程未建立。
 - **处置建议**: Phase 4 落地时在 CI 中加 `CGO_ENABLED=0 go build` + `docker build -f deploy/Dockerfile` 步骤。
+
+### ✅ D14. MySQL 驱动从未注册，生产模式 MySQL 引擎必失败 — 已修复（Week 10.3）
+
+- 引擎测试（Week 7）全部走 sqlmock（注册的是 `sqlmock` 驱动），生产路径 `sql.Open("mysql", dsn)` 实际报 `unknown driver "mysql"` 从没被发现；故障恢复测试场景 3 暴露。
+- 修复：`internal/metadata/mysql.go` 补 `_ "github.com/go-sql-driver/mysql"`。
