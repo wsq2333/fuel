@@ -20,7 +20,7 @@ var _ net.Error = fakeNetError{}
 // TestDoWithRetry_SuccessFirstTry 验证首次成功不重试。
 func TestDoWithRetry_SuccessFirstTry(t *testing.T) {
 	calls := 0
-	err := doWithRetry(context.Background(), func() error {
+	err := doWithRetry(context.Background(), "test", "k", func() error {
 		calls++
 		return nil
 	})
@@ -35,7 +35,7 @@ func TestDoWithRetry_SuccessFirstTry(t *testing.T) {
 // TestDoWithRetry_RetryableThenSuccess 验证可重试错误重试后成功。
 func TestDoWithRetry_RetryableThenSuccess(t *testing.T) {
 	calls := 0
-	err := doWithRetry(context.Background(), func() error {
+	err := doWithRetry(context.Background(), "test", "k", func() error {
 		calls++
 		if calls < 3 {
 			return fakeNetError{timeout: true}
@@ -53,7 +53,7 @@ func TestDoWithRetry_RetryableThenSuccess(t *testing.T) {
 // TestDoWithRetry_NonRetryable 验证不可重试错误立即返回。
 func TestDoWithRetry_NonRetryable(t *testing.T) {
 	calls := 0
-	err := doWithRetry(context.Background(), func() error {
+	err := doWithRetry(context.Background(), "test", "k", func() error {
 		calls++
 		return syscall.ENOENT
 	})
@@ -69,7 +69,7 @@ func TestDoWithRetry_NonRetryable(t *testing.T) {
 func TestDoWithRetry_Exhausted(t *testing.T) {
 	calls := 0
 	retryable := fakeNetError{timeout: true}
-	err := doWithRetry(context.Background(), func() error {
+	err := doWithRetry(context.Background(), "test", "k", func() error {
 		calls++
 		return retryable
 	})
@@ -85,7 +85,7 @@ func TestDoWithRetry_Exhausted(t *testing.T) {
 func TestDoWithRetry_ContextCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	calls := 0
-	err := doWithRetry(ctx, func() error {
+	err := doWithRetry(ctx, "test", "k", func() error {
 		calls++
 		cancel()
 		return context.Canceled

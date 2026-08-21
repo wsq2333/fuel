@@ -564,21 +564,32 @@ Phase 6: 多后端扩展 (按需)                       按需
   curl localhost:49999/health 返回 200 / 503 ✅ (TestServer_Health*)
 ```
 
-#### 9.2 日志体系
+#### 9.2 日志体系 ✅
 
 ```
 任务: zap 结构化日志
 文件:
-  internal/monitor/log.go          ← zap 日志初始化
-  全部模块接入 zap 日志
+  internal/monitor/log.go          ← zap JSON logger 构造（NewLogger，zap.ReplaceGlobals 全局生效）
+  internal/monitor/log_test.go     ← JSON 格式 + 级别过滤测试
+  接入点（zap.L() 全局 logger，mount 启动时 ReplaceGlobals）:
+    cmd/fuel/mount.go              ← 启动参数 / mounted / unmount / 信号处理 (INFO)
+    internal/objectstore/retry.go  ← 重试 WARN（op/key/attempt/delay）、耗尽 ERROR
+    internal/cache/eviction.go     ← LRU 淘汰 INFO（entries/freedBytes）、删除失败 WARN
+    internal/cache/verify.go       ← 巡检损坏剔除 WARN、外部丢失 DEBUG
+    internal/metadata/redis.go     ← redis 失败降级 direct WARN (getattr/listdir/mget)
+    internal/metadata/mysql.go     ← mysql 失败降级 direct WARN (getattr/listdir)
+    internal/fuse/handle.go        ← read 缓存命中/未命中 DEBUG、回源失败 ERROR
+    internal/fuse/node.go          ← getAttr 引擎故障 ERROR
+    internal/fuse/ops.go           ← 写路径 store 失败 ERROR（Week 8 已建）
 规范 (AGENTS.md §3.4):
-  INFO: 挂载/卸载、缓存淘汰、对象存储请求重试
-  WARN: 对象存储请求失败重试、缓存校验失败、元数据引擎降级
-  ERROR: 对象存储请求最终失败、FUSE 操作错误
-  DEBUG: 每次 read/write 的缓存命中/未命中
+  INFO: 挂载/卸载、缓存淘汰 ✅
+  WARN: 对象存储请求失败重试、缓存校验失败、元数据引擎降级 ✅
+  ERROR: 对象存储请求最终失败、FUSE 操作错误 ✅
+  DEBUG: 每次 read 的缓存命中/未命中 ✅（write 无缓存命中概念，写路径失败走 ERROR）
 验证:
-  日志格式为结构化 JSON
-  关键事件有日志记录
+  日志格式为结构化 JSON (TestNewLogger_JSONFormat) ✅
+  级别过滤正确 (TestNewLogger_LevelFiltering) ✅
+  非法级别报错 (TestNewLogger_InvalidLevel) ✅
 ```
 
 ### Week 10: systemd + K8s DaemonSet + 故障恢复测试
@@ -667,8 +678,8 @@ Prometheus 部署拓扑（2026-08 决策）:
 
 ```
 文件:
-  internal/monitor/metrics.go / http.go / metrics_test.go / http_test.go  ✅
-    (health 端点并入 http.go; log.go 属 9.2 日志体系待做)
+  internal/monitor/metrics.go / http.go / log.go / *_test.go  ✅
+    (health/livez/metrics 端点在 http.go; 9.1 指标 + 9.2 日志体系完成)
   deploy/Dockerfile ✅
   deploy/k8s/daemonset.yaml / configmap.yaml / secret.yaml ✅
   deploy/k8s/monitoring.yaml / prometheus-standalone.yaml ✅

@@ -9,6 +9,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"go.uber.org/zap"
 	"golang.org/x/sync/singleflight"
 
 	"fuel/api"
@@ -129,6 +130,7 @@ func (r *FuelRoot) getAttr(ctx context.Context, path string) (*api.MetaEntry, sy
 		r.metaCache.SetNeg(path)
 		return nil, syscall.ENOENT
 	}
+	zap.L().Error("getattr: metadata engine failed", zap.String("path", path), zap.Error(err))
 	return nil, syscall.EIO
 }
 

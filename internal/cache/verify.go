@@ -10,6 +10,8 @@ import (
 	"strings"
 
 	"fuel/api"
+
+	"go.uber.org/zap"
 )
 
 // 编译期断言：nvmeCache 实现 api.CacheVerifier 可选能力。
@@ -36,17 +38,22 @@ func (c *nvmeCache) Verify() api.VerifyResult {
 			if errors.Is(err, os.ErrNotExist) {
 				// 索引有但文件丢失 → 清索引（与 Get 的外部删除处理一致）
 				c.index.remove(entry.Key)
+				zap.L().Debug("verify: cache file missing, index cleaned", zap.String("key", entry.Key))
 				res.Missing = append(res.Missing, entry.Key)
 				continue
 			}
 			// 读错误（如 EIO）按损坏处理：剔除，避免坏数据被读到
 			c.removeCorrupted(entry)
+			zap.L().Warn("verify: unreadable cache file evicted",
+				zap.String("key", entry.Key), zap.String("path", entry.LocalPath), zap.Error(err))
 			res.Corrupted = append(res.Corrupted, entry.Key)
 			continue
 		}
 		res.Checked++
 		if !strings.EqualFold(sum, entry.ETag) {
 			c.removeCorrupted(entry)
+			zap.L().Warn("verify: content md5 mismatch, corrupted entry evicted",
+				zap.String("key", entry.Key), zap.String("etag", entry.ETag), zap.String("actualMD5", sum))
 			res.Corrupted = append(res.Corrupted, entry.Key)
 		}
 	}

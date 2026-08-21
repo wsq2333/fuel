@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"go.uber.org/zap"
+
 	"fuel/api"
 	"fuel/internal/config"
 )
@@ -73,6 +75,7 @@ func (e *mysqlEngine) GetAttr(ctx context.Context, path string) (*api.MetaEntry,
 		return entry, nil
 	}
 	if err != sql.ErrNoRows {
+		zap.L().Warn("mysql getattr failed, degrade to direct", zap.String("path", path), zap.Error(err))
 		return e.directEngine.GetAttr(ctx, path)
 	}
 
@@ -167,6 +170,7 @@ func (e *mysqlEngine) ListDir(ctx context.Context, dirPath string) ([]api.DirEnt
 		return entries, nil
 	}
 	if err != sql.ErrNoRows {
+		zap.L().Warn("mysql listdir failed, degrade to direct", zap.String("dir", dirPath), zap.Error(err))
 		return e.directEngine.ListDir(ctx, dirPath)
 	}
 

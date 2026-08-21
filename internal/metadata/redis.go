@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"go.uber.org/zap"
 
 	"fuel/api"
 	"fuel/internal/config"
@@ -94,6 +95,7 @@ func (e *redisEngine) GetAttr(ctx context.Context, path string) (*api.MetaEntry,
 	negCmd := pipe.Exists(ctx, e.negKey(key))
 	metaCmd := pipe.Get(ctx, e.metaKey(key))
 	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		zap.L().Warn("redis getattr failed, degrade to direct", zap.String("path", path), zap.Error(err))
 		return e.directEngine.GetAttr(ctx, path)
 	}
 	if negCmd.Val() > 0 {
@@ -173,6 +175,7 @@ func (e *redisEngine) ListDir(ctx context.Context, dirPath string) ([]api.DirEnt
 
 	data, err := e.client.Get(ctx, e.dirKey(key)).Bytes()
 	if err != nil && !errors.Is(err, redis.Nil) {
+		zap.L().Warn("redis listdir failed, degrade to direct", zap.String("dir", dirPath), zap.Error(err))
 		return e.directEngine.ListDir(ctx, dirPath)
 	}
 	if err == nil {
@@ -236,6 +239,7 @@ func (e *redisEngine) BatchGetAttr(ctx context.Context, paths []string) (map[str
 
 	vals, err := e.client.MGet(ctx, keys...).Result()
 	if err != nil {
+		zap.L().Warn("redis mget failed, degrade to direct", zap.Int("paths", len(paths)), zap.Error(err))
 		for _, p := range paths {
 			if entry, gerr := e.GetAttr(ctx, p); gerr == nil {
 				result[p] = entry

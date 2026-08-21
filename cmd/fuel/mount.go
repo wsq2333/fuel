@@ -34,6 +34,22 @@ func runMount(args []string) error {
 		cfg.Fuse.MountPoint = *mountPoint
 	}
 
+	// 日志体系 (PLAN §9.2)：全局 JSON logger，后续所有 zap.L() 生效。
+	logger, err := monitor.NewLogger(cfg.Monitor.LogLevel)
+	if err != nil {
+		return fmt.Errorf("init logger: %w", err)
+	}
+	zap.ReplaceGlobals(logger)
+	defer func() { _ = logger.Sync() }()
+
+	logger.Info("fuel starting",
+		zap.String("version", version),
+		zap.String("bucket", cfg.Storage.Bucket),
+		zap.String("mountPoint", cfg.Fuse.MountPoint),
+		zap.String("metadataEngine", cfg.Metadata.Engine),
+		zap.String("logLevel", cfg.Monitor.LogLevel),
+	)
+
 	store, err := objectstore.NewObjectStore(cfg)
 	if err != nil {
 		return fmt.Errorf("create object store: %w", err)
@@ -75,15 +91,18 @@ func runMount(args []string) error {
 		}
 		return fmt.Errorf("mount: %w", err)
 	}
+	logger.Info("mounted", zap.String("mountPoint", cfg.Fuse.MountPoint), zap.String("bucket", cfg.Storage.Bucket))
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
-		<-sigCh
+		sig := <-sigCh
+		logger.Info("received signal, unmounting", zap.String("signal", sig.String()))
 		_ = server.Unmount()
 	}()
 
 	server.Wait()
+	logger.Info("unmounted")
 	if mon != nil {
 		_ = mon.Stop()
 	}

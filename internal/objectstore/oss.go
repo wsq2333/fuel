@@ -43,7 +43,7 @@ func newOSSClient(cfg *config.Config) (api.ObjectStore, error) {
 
 func (c *ossClient) Head(ctx context.Context, key string) (*api.ObjectMeta, error) {
 	var header map[string][]string
-	err := doWithRetry(ctx, func() error {
+	err := doWithRetry(ctx, "head", key, func() error {
 		h, err := c.bucket.GetObjectDetailedMeta(key)
 		if err != nil {
 			return mapError(key, err)
@@ -66,7 +66,7 @@ func (c *ossClient) Get(ctx context.Context, key string, offset, length int64) (
 	}
 
 	var body io.ReadCloser
-	err := doWithRetry(ctx, func() error {
+	err := doWithRetry(ctx, "get", key, func() error {
 		rc, err := c.bucket.GetObject(key, options...)
 		if err != nil {
 			return mapError(key, err)
@@ -81,7 +81,7 @@ func (c *ossClient) Get(ctx context.Context, key string, offset, length int64) (
 }
 
 func (c *ossClient) Put(ctx context.Context, key string, r io.Reader, size int64) (*api.ObjectMeta, error) {
-	err := doWithRetry(ctx, func() error {
+	err := doWithRetry(ctx, "put", key, func() error {
 		if err := c.bucket.PutObject(key, r); err != nil {
 			return mapError(key, err)
 		}
@@ -103,7 +103,7 @@ func (c *ossClient) List(ctx context.Context, prefix, delimiter string, maxKeys 
 	}
 
 	var result oss.ListObjectsResultV2
-	err := doWithRetry(ctx, func() error {
+	err := doWithRetry(ctx, "list", prefix, func() error {
 		res, err := c.bucket.ListObjectsV2(options...)
 		if err != nil {
 			return mapError(prefix, err)
@@ -123,7 +123,7 @@ func (c *ossClient) List(ctx context.Context, prefix, delimiter string, maxKeys 
 }
 
 func (c *ossClient) Copy(ctx context.Context, srcKey, dstKey string) error {
-	return doWithRetry(ctx, func() error {
+	return doWithRetry(ctx, "copy", srcKey, func() error {
 		if _, err := c.bucket.CopyObject(srcKey, dstKey); err != nil {
 			return mapError(srcKey, err)
 		}
@@ -132,7 +132,7 @@ func (c *ossClient) Copy(ctx context.Context, srcKey, dstKey string) error {
 }
 
 func (c *ossClient) Delete(ctx context.Context, key string) error {
-	return doWithRetry(ctx, func() error {
+	return doWithRetry(ctx, "delete", key, func() error {
 		if err := c.bucket.DeleteObject(key); err != nil {
 			return mapError(key, err)
 		}

@@ -67,17 +67,22 @@ func (fh *fileHandle) read(ctx context.Context, dest []byte, off int64) (fuse.Re
 
 	fh.mu.Lock()
 	if fh.local == nil {
+		zap.L().Debug("read cache miss, fetching", zap.String("key", fh.key), zap.Int64("off", off))
 		localPath, err := fh.node.root.fetchAndCache(ctx, fh.key, fh.etag, fh.size)
 		if err != nil {
 			fh.mu.Unlock()
+			zap.L().Error("read: fetch from object store failed", zap.String("key", fh.key), zap.Error(err))
 			return nil, syscall.EIO
 		}
 		f, err := os.Open(localPath)
 		if err != nil {
 			fh.mu.Unlock()
+			zap.L().Error("read: open cached file failed", zap.String("key", fh.key), zap.String("path", localPath), zap.Error(err))
 			return nil, syscall.EIO
 		}
 		fh.local = f
+	} else {
+		zap.L().Debug("read cache hit", zap.String("key", fh.key), zap.Int64("off", off), zap.Int("len", len(dest)))
 	}
 	local := fh.local
 	fh.mu.Unlock()

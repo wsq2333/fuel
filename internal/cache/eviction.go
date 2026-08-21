@@ -2,6 +2,8 @@ package cache
 
 import (
 	"os"
+
+	"go.uber.org/zap"
 )
 
 // evictToWatermark 淘汰最久未访问的条目，直到 used 低于目标字节数。
@@ -9,6 +11,7 @@ import (
 // 索引条目已移除，避免同一损坏文件反复阻碍淘汰。
 func (c *nvmeCache) evictToWatermark(target int64) int64 {
 	var freed int64
+	var evicted int
 	for c.index.usedBytes() > target {
 		entry := c.index.evictOldest()
 		if entry == nil {
@@ -16,9 +19,17 @@ func (c *nvmeCache) evictToWatermark(target int64) int64 {
 		}
 		if err := os.Remove(entry.LocalPath); err != nil && !os.IsNotExist(err) {
 			// 文件删除失败（如 EIO），索引已移除，继续淘汰下一个
+			zap.L().Warn("eviction: remove cache file failed",
+				zap.String("key", entry.Key), zap.Error(err))
 			continue
 		}
 		freed += entry.Size
+		evicted++
+	}
+	if evicted > 0 {
+		zap.L().Info("cache eviction",
+			zap.Int("entries", evicted), zap.Int64("freedBytes", freed),
+			zap.Int64("usedBytes", c.index.usedBytes()), zap.Int64("targetBytes", target))
 	}
 	return freed
 }

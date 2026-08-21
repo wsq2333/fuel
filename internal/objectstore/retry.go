@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
+	"go.uber.org/zap"
 )
 
 // 重试策略 (IMPL_DESIGN §9.1): 指数退避, 最多 3 次。
@@ -22,11 +23,16 @@ const (
 
 // doWithRetry 对可重试错误执行指数退避重试。
 // fn 返回的 error 若不可重试或重试耗尽，则返回给调用方。
-func doWithRetry(ctx context.Context, fn func() error) error {
+// 重试中 WARN，重试耗尽 ERROR（AGENTS.md §3.2 / PLAN §9.2）。
+func doWithRetry(ctx context.Context, op, key string, fn func() error) error {
 	var lastErr error
 	for attempt := 0; attempt < retryMaxAttempts; attempt++ {
 		if attempt > 0 {
 			delay := retryBaseDelay<<uint(attempt-1) + jitter()
+			zap.L().Warn("storage request failed, retrying",
+				zap.String("op", op), zap.String("key", key),
+				zap.Int("attempt", attempt+1), zap.Int("maxAttempts", retryMaxAttempts),
+				zap.Duration("delay", delay), zap.Error(lastErr))
 			if err := sleep(ctx, delay); err != nil {
 				return err
 			}
@@ -40,6 +46,9 @@ func doWithRetry(ctx context.Context, fn func() error) error {
 			return lastErr
 		}
 	}
+	zap.L().Error("storage request failed after retries",
+		zap.String("op", op), zap.String("key", key),
+		zap.Int("attempts", retryMaxAttempts), zap.Error(lastErr))
 	return lastErr
 }
 
